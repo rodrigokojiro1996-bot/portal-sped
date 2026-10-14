@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+/data/
+*.sqlite3
+*.sqlite3-*
+/.secret
+*credentials*.csv
+sped-import-report.csv
+/SPEDs/
+.venv/
+.env*
