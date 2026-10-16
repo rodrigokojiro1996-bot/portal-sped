@@ -10,7 +10,7 @@ echo ============================================
 echo   Portal Fiscal - redefinir senha de loja
 echo ============================================
 echo.
-set /p "CNPJ=Digite o CNPJ da loja e tecle Enter: "
+set /p "CNPJ=Digite o CNPJ da loja (ou o usuario do suporte) e tecle Enter: "
 echo.
 "%PYTHON%" app.py redefinir-senha "%CNPJ%"
 echo.

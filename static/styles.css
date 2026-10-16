@@ -81,6 +81,22 @@ a{color:inherit;text-decoration:none}
 .pill.pending{border-style:dashed;border-color:#c9d9d6;background:transparent;color:#7b8b88}.pill.pending:hover{border-color:#9fd3cb;color:var(--green-deep)}.pill.pending.active{border-style:solid;background:#fff;border-color:var(--green-deep);color:var(--green-deep)}
 .period-next{display:flex;align-items:center;flex-wrap:wrap;gap:6px 8px;margin:10px 0 0;font-size:12px;color:#53635f}.period-next>.icon{width:15px;height:15px;color:var(--green-deep)}.period-next strong{color:var(--ink)}
 
+/* Aviso do acesso de suporte */
+.notice-info{display:flex;align-items:flex-start;gap:10px;border-color:#bce8e2;background:#eef8f6;color:#175f58;line-height:1.5}.notice-info .icon{margin-top:1px;color:var(--green-deep)}
+
+/* Monitoramento do suporte */
+.audit-filters{display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px;margin:-6px 0 16px;padding:14px 16px;background:#fff;border:1px solid var(--line);border-radius:7px}
+.audit-filters label{display:grid;gap:5px;flex:1 1 180px;font-size:11px;font-weight:600;color:#53635f}
+.audit-filters select{height:36px;width:100%;border:1px solid #dce5e1;border-radius:5px;background:#fff;padding:0 10px;font:12px 'DM Sans',sans-serif;color:var(--ink)}
+.audit-filters select:focus{outline:none;border-color:var(--green);box-shadow:0 0 0 3px #087e7018}
+.audit-filter-actions{display:flex;gap:8px;flex-wrap:wrap}
+.audit-table td{vertical-align:top}.audit-table .day-row td{background:#f6fbfa;color:var(--green-deep);font-size:11px;font-weight:700;letter-spacing:.3px;padding:9px 16px}
+.audit-cell.audit-machine strong,.audit-cell.audit-machine small,.audit-table td.mono{white-space:nowrap}
+.audit-cell strong{display:block;font-weight:600;color:var(--ink);white-space:normal}.audit-cell small{display:block;margin-top:2px;font-size:11px;color:var(--muted);white-space:normal}
+.audit-what{display:flex;align-items:flex-start;gap:10px;min-width:280px;white-space:normal}.audit-what>span:last-child{min-width:0;overflow-wrap:anywhere}
+.audit-badge{flex:none;display:inline-flex;align-items:center;height:22px;padding:0 8px;border-radius:99px;font-size:10px;font-weight:700;letter-spacing:.3px}
+.badge-acessos{background:#e5f7f4;color:#075e59}.badge-consultas{background:#eef2f1;color:#3e5653}.badge-downloads{background:var(--green-deep);color:#fff}.badge-alertas{background:#fdecea;color:#a53b34}
+
 /* Previsão de publicação e ajuda "?" */
 .forecast-card{display:flex;align-items:flex-start;gap:16px;background:#fff;border:1px solid var(--line);border-radius:7px;padding:22px 24px}
 .forecast-icon{display:grid;place-items:center;flex:none;width:44px;height:44px;border-radius:10px;background:#fff0e8;color:#c94d15}.forecast-icon .icon{width:21px;height:21px}

@@ -15,6 +15,14 @@ import app
 import resumo_sped
 
 
+def restore_storage():
+    """Volta os caminhos do portal para data/ sem abrir nem alterar o banco real."""
+    app.DATA_DIR = app.ROOT / "data"
+    app.DATABASE = app.DATA_DIR / "portal.sqlite3"
+    app.DOCUMENTS = app.DATA_DIR / "documentos"
+    app.APP_SECRET = None
+
+
 class CnpjTests(unittest.TestCase):
     def test_validates_check_digits(self):
         self.assertTrue(app.valid_cnpj("11.222.333/0001-81"))
@@ -79,6 +87,137 @@ class StorageTests(unittest.TestCase):
             self.assertEqual((user["cnpj"], user["role"]), ("11222333000181", "store"))
 
 
+class SupportAccessTests(unittest.TestCase):
+    """Perfil de suporte: vê todas as lojas, só consulta e baixa; tudo fica registrado para a administração."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        app.configure_storage(Path(self.temporary.name))
+        app.create_user("11222333000181", "Loja Exemplo A", "store", "senha-loja-a-123")
+        app.create_user("11444777000161", "Loja Exemplo B", "store", "senha-loja-b-123")
+        app.create_user(None, "Admin Exemplo", "admin", "senha-admin-123", "admin.teste")
+        self.support_password = app.create_support_user("suporte.teste", "Suporte Exemplo")
+        with app.connect() as db:
+            ids = {row["name"]: row["id"] for row in db.execute("SELECT id, name FROM users")}
+            self.store_b = ids["Loja Exemplo B"]
+            for user_id, token in ((ids["Suporte Exemplo"], "support-session"), (ids["Admin Exemplo"], "admin-session"), (ids["Loja Exemplo A"], "store-session")):
+                db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (app.token_hash(token), user_id, "csrf-" + token, int(time.time()) + 3600))
+            content = b"conteudo do sped da loja b"
+            db.execute("INSERT INTO documents VALUES ('doc-b', ?, 'fiscal', '2026-09', 'sped-loja-b.txt', ?, ?, ?)", (self.store_b, len(content), hashlib.sha256(content).hexdigest(), "2026-10-12T00:00:00+00:00"))
+        (app.DOCUMENTS / "doc-b.txt").write_bytes(content)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), app.PortalHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        restore_storage()
+        self.temporary.cleanup()
+
+    def request(self, token, path, data=None):
+        from urllib.parse import urlencode
+        headers = {"Cookie": f"portal_session={token}", "User-Agent": "Mozilla/5.0 (Windows NT 10.0) Chrome/130.0 Edg/130.0"}
+        body = urlencode(data).encode() if data is not None else None
+        try:
+            with urlopen(Request(self.base + path, data=body, headers=headers)) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            with error:
+                return error.code, error.read()
+
+    def log(self):
+        with app.connect() as db:
+            return [dict(row) for row in db.execute("SELECT * FROM audit_log ORDER BY id")]
+
+    def test_support_sees_every_store_and_downloads_but_cannot_publish(self):
+        status, page = self.request("support-session", "/dashboard?type=fiscal")
+        self.assertEqual(status, 200)
+        page = page.decode()
+        self.assertIn("Loja Exemplo A", page)
+        self.assertIn("Loja Exemplo B", page)
+        self.assertIn("Acesso de suporte", page)
+        self.assertNotIn("Enviar arquivo SPED", page)
+        self.assertNotIn("Cadastrar loja", page)
+        self.assertEqual(self.request("support-session", "/download/doc-b"), (200, b"conteudo do sped da loja b"))
+        self.assertEqual(self.request("support-session", "/upload", {"csrf": "csrf-support-session"})[0], 403)
+        self.assertEqual(self.request("support-session", "/stores", {"csrf": "csrf-support-session"})[0], 403)
+        self.assertEqual(self.request("support-session", "/monitoramento")[0], 403)
+        actions = [entry["action"] for entry in self.log()]
+        self.assertEqual(actions, ["abriu_central", "baixou_arquivo", "acao_bloqueada", "acao_bloqueada", "acao_bloqueada"])
+
+    def test_every_action_records_store_file_time_machine_and_browser(self):
+        self.request("support-session", f"/dashboard?type=fiscal&store_id={self.store_b}&competence=2026-09")
+        self.request("support-session", f"/dashboard?type=fiscal&store_id={self.store_b}&competence=2026-09")  # recarregar não repete
+        self.request("support-session", "/download/doc-b")
+        visit, download = self.log()
+        self.assertEqual((visit["action"], visit["store_name"], visit["competence"]), ("abriu_loja", "Loja Exemplo B", "2026-09"))
+        self.assertEqual((download["action"], download["file_name"], download["store_cnpj"]), ("baixou_arquivo", "sped-loja-b.txt", "11444777000161"))
+        self.assertEqual(download["machine"], app.socket.gethostname().upper())
+        self.assertEqual(download["ip"], "127.0.0.1")
+        self.assertEqual(download["browser"], "Edge no Windows")
+        self.assertEqual(download["user_name"], "Suporte Exemplo")
+        self.assertRegex(download["created_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$")
+
+    def test_login_and_wrong_password_of_support_are_recorded_but_store_actions_are_not(self):
+        import http.cookiejar
+        import re
+        from urllib.parse import urlencode
+        from urllib.request import HTTPCookieProcessor, build_opener
+        for password in ("senha-errada-000", self.support_password):
+            opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+            csrf = re.search(r"name='csrf' value='([^']+)'", opener.open(self.base + "/login").read().decode()).group(1)
+            try:
+                opener.open(self.base + "/login", urlencode({"csrf": csrf, "cnpj": "suporte.teste", "password": password}).encode()).read()
+            except HTTPError as error:
+                error.close()
+        self.request("store-session", "/dashboard?type=fiscal")
+        self.request("admin-session", "/dashboard?type=fiscal")
+        self.assertEqual([entry["action"] for entry in self.log()], ["login_falhou", "login", "abriu_central"])
+
+    def test_admin_sees_clear_history_and_exports_csv(self):
+        self.request("support-session", f"/dashboard?type=fiscal&store_id={self.store_b}&competence=2026-09")
+        self.request("support-session", "/download/doc-b")
+        status, page = self.request("admin-session", "/monitoramento?periodo=hoje")
+        page = page.decode()
+        self.assertEqual(status, 200)
+        self.assertIn("Monitoramento do suporte", page)
+        self.assertIn("Baixou o arquivo sped-loja-b.txt", page)
+        self.assertIn("Consultou a loja", page)
+        self.assertIn("SPED Fiscal · Setembro/2026", page)
+        self.assertIn("Hoje · ", page)
+        status, csv_body = self.request("admin-session", "/monitoramento.csv?periodo=hoje&acao=downloads")
+        text = csv_body.decode("utf-8-sig").splitlines()
+        self.assertEqual(text[0].split(";")[:3], ["Data", "Hora", "Usuário"])
+        self.assertEqual(len(text), 2)
+        self.assertIn("sped-loja-b.txt", text[1])
+
+    def test_old_database_is_migrated_to_accept_support_role(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            legacy = sqlite3.connect(Path(temporary) / "portal.sqlite3")
+            legacy.executescript("""
+                CREATE TABLE users (id INTEGER PRIMARY KEY, cnpj TEXT UNIQUE, login_name TEXT UNIQUE, name TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('admin', 'store')), password_hash TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+                CREATE TABLE documents (id TEXT PRIMARY KEY, store_id INTEGER NOT NULL REFERENCES users(id), document_type TEXT NOT NULL CHECK(document_type IN ('fiscal', 'contribuicoes')),
+                    competence TEXT NOT NULL, original_name TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL, uploaded_at TEXT NOT NULL, UNIQUE(store_id, document_type, sha256));
+                INSERT INTO users VALUES (7, '11222333000181', NULL, 'Loja Antiga', 'store', 'hash', 1, '2026-01-01');
+                INSERT INTO documents VALUES ('d1', 7, 'fiscal', '2026-09', 'a.txt', 1, 'x', '2026-10-01');
+            """)
+            legacy.commit()
+            legacy.close()
+            try:
+                app.configure_storage(Path(temporary))
+                app.create_support_user("suporte.migrado", "Suporte Migrado")
+                with app.connect() as db:
+                    self.assertEqual(db.execute("SELECT name FROM users WHERE id=7").fetchone()[0], "Loja Antiga")
+                    self.assertEqual(db.execute("SELECT store_id FROM documents WHERE id='d1'").fetchone()[0], 7)
+                    self.assertEqual(db.execute("SELECT role FROM users WHERE login_name='suporte.migrado'").fetchone()[0], "support")
+            finally:
+                restore_storage()
+
+
 class PasswordResetTests(unittest.TestCase):
     def test_reset_replaces_password_and_clears_sessions_and_lockouts(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -100,7 +239,7 @@ class PasswordResetTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     app.reset_store_password("11444777000161")
             finally:
-                app.configure_storage(app.ROOT / "data")
+                restore_storage()
 
 
 class LoginFormTests(unittest.TestCase):
@@ -119,7 +258,7 @@ class LoginFormTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join()
-        app.configure_storage(app.ROOT / "data")
+        restore_storage()
         self.temporary.cleanup()
 
     def open_login(self, opener):
@@ -197,7 +336,7 @@ class BranchAccessTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.server_thread.join()
-        app.configure_storage(app.ROOT / "data")
+        restore_storage()
         self.temporary.cleanup()
 
     def request_as_matrix(self, path):
@@ -340,7 +479,7 @@ class PublicationForecastTests(unittest.TestCase):
                 self.assertIn("entra na fila", page)
                 self.assertIn("Dez/26", page)
             finally:
-                app.configure_storage(app.ROOT / "data")
+                restore_storage()
 
 
 class DashboardSummaryTests(unittest.TestCase):
@@ -370,7 +509,7 @@ class DashboardSummaryTests(unittest.TestCase):
                 with app.connect() as db:
                     self.assertEqual(db.execute("SELECT COUNT(*) FROM document_summaries").fetchone()[0], 1)
             finally:
-                app.configure_storage(app.ROOT / "data")
+                restore_storage()
 
 
 if __name__ == "__main__":

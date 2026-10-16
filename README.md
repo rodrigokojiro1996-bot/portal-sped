@@ -27,6 +27,33 @@ O servidor escuta apenas em `127.0.0.1` por padrão. Para encerrar, use `Ctrl+C`
 
 Cada instalação deve criar seu próprio administrador e cadastrar suas lojas. Nenhum usuário, senha, arquivo fiscal ou conjunto de dados local é fornecido pelo repositório.
 
+## Perfis de acesso
+
+| Perfil | Entra com | Vê | Pode |
+| --- | --- | --- | --- |
+| Administração | usuário (ex.: `admin.fa`) | todas as lojas e o monitoramento do suporte | publicar arquivos, cadastrar lojas, baixar |
+| Suporte | usuário (ex.: `suporte`) | todas as lojas | só consultar e baixar arquivos |
+| Loja | CNPJ | as lojas do próprio grupo (mesma raiz de CNPJ) | consultar e baixar |
+
+Para criar um usuário de suporte, use `criar-usuario-suporte.bat`. A senha aparece na tela e é acrescentada em `admin-credentials.txt` na Área de Trabalho. Pela linha de comando:
+
+```powershell
+python app.py criar-suporte suporte "Suporte Farmácias Associadas" --salvar-em "$env:USERPROFILE\Desktop\admin-credentials.txt"
+```
+
+Para trocar a senha de uma loja ou do suporte, use `redefinir-senha.bat`, informando o CNPJ da loja ou o usuário do suporte.
+
+### Monitoramento do suporte
+
+Tudo o que um usuário de suporte faz fica registrado. A administração consulta em **Monitoramento**, na barra lateral:
+
+- entradas e saídas do portal e tentativas com a senha errada;
+- cada loja consultada, com o tipo de SPED e o mês;
+- cada arquivo baixado;
+- tentativas bloqueadas, como publicar, cadastrar ou abrir o monitoramento.
+
+Cada registro guarda data e hora, usuário, loja e CNPJ, arquivo, nome da máquina, IP e navegador. Há filtros por usuário, período e tipo de ação, e o botão **Exportar para Excel** gera um CSV com o histórico filtrado. O nome da máquina é o informado pela rede (DNS ou NetBIOS); quando a rede não informa, aparece só o IP. O suporte vê um aviso de que suas ações são registradas.
+
 ## Servidor provisório no Windows
 
 Enquanto o portal não tem hospedagem definitiva, ele pode rodar neste computador:
@@ -36,6 +63,8 @@ Enquanto o portal não tem hospedagem definitiva, ele pode rodar neste computado
 | `iniciar-portal.bat` | Sobe o portal em http://127.0.0.1:8000. Se o processo cair, reinicia em 10 segundos. Se o portal já estiver no ar, não abre uma segunda cópia. Registro em `logs/portal.log`. |
 | `instalar-servico.bat` | Cria a tarefa do Windows **Portal Fiscal**, que roda o `iniciar-portal.bat` como SYSTEM sempre que o computador liga, mesmo sem ninguém fazer login. Pede permissão de administrador. |
 | `remover-servico.bat` | Remove a tarefa e para o portal. |
+| `criar-usuario-suporte.bat` | Cria um usuário de suporte e guarda a credencial na Área de Trabalho. |
+| `redefinir-senha.bat` | Gera uma senha nova para uma loja (CNPJ) ou para o suporte (usuário). |
 
 Para ver se a tarefa está instalada e o portal no ar:
 

@@ -8,10 +8,12 @@ import json
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from http import HTTPStatus
@@ -35,6 +37,25 @@ LOGIN_FORM_SECONDS = 2 * 60 * 60
 # Senhas geradas pelo portal: sem caracteres que se confundem ao ler ou digitar (0/O, 1/l/I).
 READABLE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
 APP_SECRET: bytes | None = None
+
+# Perfis de acesso:
+#   admin   - vê todas as lojas, publica arquivos, cadastra lojas e vê o monitoramento;
+#   support - vê todas as lojas e baixa arquivos (somente consulta); tudo o que faz é registrado;
+#   store   - vê só as lojas do próprio grupo (mesma raiz de CNPJ).
+USER_ROLES = ("admin", "support", "store")
+STAFF_ROLES = ("admin", "support")
+AUDITED_ROLES = ("support",)
+ROLE_LABELS = {"admin": "Administração", "support": "Suporte", "store": "Acesso da loja"}
+USERS_TABLE_SQL = """CREATE TABLE {name} (
+    id INTEGER PRIMARY KEY,
+    cnpj TEXT UNIQUE,
+    login_name TEXT UNIQUE,
+    name TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('admin', 'support', 'store')),
+    password_hash TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+)"""
 
 
 def configure_storage(data_dir: Path | None = None) -> None:
@@ -78,20 +99,43 @@ def connect() -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
+def migrate_user_roles() -> None:
+    """Bancos antigos só aceitavam os perfis admin e store: recria a tabela de usuários com o perfil support.
+
+    Segue o procedimento do SQLite para alterar uma restrição (chaves estrangeiras desligadas durante a troca).
+    """
+    connection = sqlite3.connect(DATABASE, timeout=10, isolation_level=None)
+    try:
+        row = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").fetchone()
+        if row is None or "'support'" in row[0]:
+            return
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(USERS_TABLE_SQL.format(name="users_migration"))
+            connection.execute("INSERT INTO users_migration (id, cnpj, login_name, name, role, password_hash, active, created_at) "
+                               "SELECT id, cnpj, login_name, name, role, password_hash, active, created_at FROM users")
+            connection.execute("DROP TABLE users")
+            connection.execute("ALTER TABLE users_migration RENAME TO users")
+            if connection.execute("PRAGMA foreign_key_check").fetchall():
+                raise sqlite3.IntegrityError("Referências inválidas após migrar a tabela de usuários.")
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.execute("PRAGMA foreign_keys = ON")
+    finally:
+        connection.close()
+
+
 def initialize_database() -> None:
+    with connect() as db:
+        db.execute(USERS_TABLE_SQL.format(name="IF NOT EXISTS users"))
+    migrate_user_roles()
     with connect() as db:
         db.executescript(
             """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY,
-                cnpj TEXT UNIQUE,
-                login_name TEXT UNIQUE,
-                name TEXT NOT NULL,
-                role TEXT NOT NULL CHECK(role IN ('admin', 'store')),
-                password_hash TEXT NOT NULL,
-                active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS sessions (
                 token_hash TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -148,6 +192,27 @@ def initialize_database() -> None:
             summary TEXT NOT NULL,
             created_at TEXT NOT NULL
         )""")
+        # Monitoramento: cada ação dos perfis auditados. Nomes ficam copiados no registro
+        # para o histórico continuar legível mesmo se uma loja ou usuário mudar depois.
+        db.execute("""CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            user_id INTEGER,
+            user_name TEXT NOT NULL,
+            login_name TEXT,
+            action TEXT NOT NULL,
+            store_id INTEGER,
+            store_name TEXT,
+            store_cnpj TEXT,
+            document_type TEXT,
+            competence TEXT,
+            file_name TEXT,
+            detail TEXT,
+            ip TEXT,
+            machine TEXT,
+            browser TEXT
+        )""")
+        db.execute("CREATE INDEX IF NOT EXISTS audit_log_created ON audit_log(created_at)")
 
 
 def normalize_cnpj(value: str) -> str:
@@ -211,12 +276,14 @@ def verify_password(password: str, stored: str) -> bool:
 
 
 def create_user(cnpj: str | None, name: str, role: str, password: str, login_name: str | None = None) -> None:
+    if role not in USER_ROLES:
+        raise ValueError("Perfil de acesso desconhecido.")
     normalized = normalize_cnpj(cnpj or "") if role == "store" else None
     if role == "store" and not valid_cnpj(normalized or ""):
         raise ValueError("Informe um CNPJ válido.")
-    username = (login_name or "").strip().lower() if role == "admin" else None
-    if role == "admin" and (not username or not re.fullmatch(r"[a-z0-9._-]{3,40}", username)):
-        raise ValueError("O usuário administrativo deve ter 3 a 40 caracteres: letras, números, ponto, hífen ou sublinhado.")
+    username = (login_name or "").strip().lower() if role in STAFF_ROLES else None
+    if role in STAFF_ROLES and (not username or not re.fullmatch(r"[a-z0-9._-]{3,40}", username)):
+        raise ValueError("O usuário deve ter 3 a 40 caracteres: letras, números, ponto, hífen ou sublinhado.")
     if len(password) < 12:
         raise ValueError("A senha deve ter pelo menos 12 caracteres.")
     with connect() as db:
@@ -226,18 +293,131 @@ def create_user(cnpj: str | None, name: str, role: str, password: str, login_nam
         )
 
 
-def reset_store_password(cnpj: str) -> tuple[str, str]:
-    """Gera uma senha nova para a loja, encerra as sessões dela e libera bloqueios de tentativas de login."""
-    normalized = normalize_cnpj(cnpj)
-    password = "-".join("".join(secrets.choice(READABLE_ALPHABET) for _ in range(4)) for _ in range(3))
+def readable_password() -> str:
+    """Senha no formato Kp7m-Xq4t-Rw9z: 12 caracteres sem 0/O e 1/l/I, fácil de ler e digitar."""
+    return "-".join("".join(secrets.choice(READABLE_ALPHABET) for _ in range(4)) for _ in range(3))
+
+
+def reset_store_password(identifier: str) -> tuple[str, str]:
+    """Gera uma senha nova (loja pelo CNPJ ou suporte pelo usuário), encerra as sessões e libera bloqueios de login."""
+    digits = normalize_cnpj(identifier)
+    password = readable_password()
     with connect() as db:
-        store = db.execute("SELECT id, name FROM users WHERE role='store' AND cnpj=?", (normalized,)).fetchone()
-        if not store:
-            raise ValueError("Nenhuma loja cadastrada com esse CNPJ.")
-        db.execute("UPDATE users SET password_hash=?, active=1 WHERE id=?", (password_digest(password), store["id"]))
-        db.execute("DELETE FROM sessions WHERE user_id=?", (store["id"],))
+        if len(digits) == 14:
+            account = db.execute("SELECT id, name FROM users WHERE role='store' AND cnpj=?", (digits,)).fetchone()
+            missing = "Nenhuma loja cadastrada com esse CNPJ."
+        else:
+            account = db.execute("SELECT id, name FROM users WHERE role='support' AND login_name=?", (identifier.strip().lower(),)).fetchone()
+            missing = "Nenhum usuário de suporte com esse nome. Informe o CNPJ da loja ou o usuário do suporte."
+        if not account:
+            raise ValueError(missing)
+        db.execute("UPDATE users SET password_hash=?, active=1 WHERE id=?", (password_digest(password), account["id"]))
+        db.execute("DELETE FROM sessions WHERE user_id=?", (account["id"],))
         db.execute("DELETE FROM login_attempts")
-    return store["name"], password
+    return account["name"], password
+
+
+def create_support_user(login_name: str, name: str) -> str:
+    """Cria um usuário de suporte (somente consulta e download) e devolve a senha gerada."""
+    password = readable_password()
+    try:
+        create_user(None, name, "support", password, login_name)
+    except sqlite3.IntegrityError as error:
+        raise ValueError(f"Já existe um usuário chamado '{login_name}'.") from error
+    return password
+
+
+# --------------------------------------------------------------------------- monitoramento do suporte
+
+AUDIT_ACTIONS = {
+    # ação: (rótulo curto do selo, categoria do filtro)
+    "login": ("Acesso", "acessos"),
+    "logout": ("Acesso", "acessos"),
+    "login_falhou": ("Alerta", "alertas"),
+    "abriu_central": ("Consulta", "consultas"),
+    "abriu_loja": ("Consulta", "consultas"),
+    "baixou_arquivo": ("Download", "downloads"),
+    "acao_bloqueada": ("Alerta", "alertas"),
+}
+AUDIT_FILTERS = {"": "Todas as ações", "acessos": "Entradas e saídas", "consultas": "Lojas consultadas", "downloads": "Arquivos baixados", "alertas": "Alertas"}
+AUDIT_PERIODS = {"hoje": ("Hoje", 0), "7d": ("Últimos 7 dias", 6), "30d": ("Últimos 30 dias", 29), "tudo": ("Todo o período", None)}
+WEEKDAYS = ("segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo")
+_machine_cache: dict[str, str] = {}
+_machine_resolver = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nome-maquina")
+
+
+def machine_name(ip: str) -> str:
+    """Nome do computador de onde veio o acesso, pela rede (DNS/NetBIOS). Vazio quando a rede não informa."""
+    if ip in _machine_cache:
+        return _machine_cache[ip]
+    if ip in ("127.0.0.1", "::1"):
+        name = socket.gethostname().upper()
+    else:
+        try:
+            name = _machine_resolver.submit(socket.gethostbyaddr, ip).result(timeout=1.5)[0].split(".")[0].upper()
+        except Exception:
+            name = ""
+    _machine_cache[ip] = name
+    return name
+
+
+def browser_label(agent: str) -> str:
+    browser = ("Edge" if "Edg/" in agent else "Opera" if "OPR/" in agent else "Chrome" if "Chrome/" in agent
+               else "Firefox" if "Firefox/" in agent else "Safari" if "Safari/" in agent else "Navegador não identificado")
+    system = ("Windows" if "Windows" in agent else "Android" if "Android" in agent else "iPhone" if ("iPhone" in agent or "iPad" in agent)
+              else "macOS" if "Mac OS" in agent else "Linux" if "Linux" in agent else "")
+    return f"{browser} no {system}" if system else browser
+
+
+def audit_sentence(entry: sqlite3.Row) -> tuple[str, str]:
+    """Frase principal e complemento que descrevem uma ação registrada, em linguagem simples."""
+    type_label = DOCUMENT_TYPES.get(entry["document_type"] or "", ("", "", ""))[0]
+    month = resumo_sped.month_label(entry["competence"]).capitalize() if entry["competence"] else ""
+    context = " · ".join(part for part in (type_label, month) if part)
+    action = entry["action"]
+    if action == "login":
+        return "Entrou no portal", ""
+    if action == "logout":
+        return "Saiu do portal", ""
+    if action == "login_falhou":
+        return "Tentou entrar com a senha errada", "O acesso foi recusado"
+    if action == "abriu_central":
+        return "Abriu a lista de todas as lojas", type_label
+    if action == "abriu_loja":
+        return "Consultou a loja", context
+    if action == "baixou_arquivo":
+        return f"Baixou o arquivo {entry['file_name']}", context
+    if action == "acao_bloqueada":
+        return f"Tentou {entry['detail']}", "Bloqueado: o suporte só consulta e baixa arquivos"
+    return action, ""
+
+
+def audit_entries(user_id: str = "", period: str = "7d", category: str = "", limit: int | None = 500) -> list[sqlite3.Row]:
+    clauses, params = [], []
+    if user_id.isdigit():
+        clauses.append("user_id=?")
+        params.append(int(user_id))
+    days = AUDIT_PERIODS.get(period, AUDIT_PERIODS["7d"])[1]
+    if days is not None:
+        clauses.append("created_at >= ?")
+        params.append((date.today() - timedelta(days=days)).isoformat())
+    actions = [action for action, (_, group) in AUDIT_ACTIONS.items() if group == category]
+    if actions:
+        clauses.append(f"action IN ({','.join('?' * len(actions))})")
+        params.extend(actions)
+    sql = "SELECT * FROM audit_log" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY id DESC"
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    with connect() as db:
+        return db.execute(sql, params).fetchall()
+
+
+def csv_cell(value: object) -> str:
+    """Célula de CSV para Excel (separador ;), protegida contra fórmulas injetadas."""
+    text = "" if value is None else str(value)
+    if text[:1] in ("=", "+", "-", "@"):
+        text = "'" + text
+    return '"' + text.replace('"', '""') + '"' if any(char in text for char in ';"\n\r') else text
 
 
 def document_summary(document: sqlite3.Row) -> dict | None:
@@ -297,6 +477,8 @@ ICONS = {
     "plus": "<path d='M12 5v14'/><path d='M5 12h14'/>",
     "lock": "<rect x='5' y='11' width='14' height='9' rx='2'/><path d='M8 11V8a4 4 0 0 1 8 0v3'/>",
     "calendar": "<rect x='4' y='5' width='16' height='15' rx='2'/><path d='M4 10h16'/><path d='M9 3v4'/><path d='M15 3v4'/>",
+    "eye": "<path d='M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z'/><circle cx='12' cy='12' r='3'/>",
+    "filter": "<path d='M4 5h16l-6 7.5V19l-4-2v-4.5z'/>",
 }
 
 
@@ -401,7 +583,7 @@ def short_store_names(stores: list[sqlite3.Row]) -> dict[int, str]:
 def render_page(title: str, content: str, user: sqlite3.Row | None = None) -> bytes:
     nav = ""
     if user:
-        nav = (f"<div class='user-chip'><span class='user-mark'>{h(user['name'][:1].upper())}</span><span class='user-text'>{h(user['name'])}<small>{'Administração' if user['role'] == 'admin' else 'Acesso da loja'}</small></span>"
+        nav = (f"<div class='user-chip'><span class='user-mark'>{h(user['name'][:1].upper())}</span><span class='user-text'>{h(user['name'])}<small>{ROLE_LABELS.get(user['role'], '')}</small></span>"
                f"<form method='post' action='/logout'><input type='hidden' name='csrf' value='{h(user['csrf_token'])}'><button class='btn btn-ghost btn-sm' type='submit'>{icon('logout')}<span>Sair</span></button></form></div>")
     brand = "<a class='brand' href='/dashboard'><img class='brand-logo' src='/static/farmacias-associadas-logo.png' alt='Farmácias Associadas'><span class='brand-context'>PORTAL FISCAL</span></a>"
     return (f"<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='theme-color' content='#087e70'><title>{h(title)} · Portal Fiscal</title><link rel='stylesheet' href='/static/styles.css'></head><body><header class='topbar'>{brand}{nav}</header>{content}<footer class='site-footer'><span>PORTAL FISCAL <i></i> FARMÁCIAS ASSOCIADAS</span><span>Documentos acessíveis somente à loja autorizada.</span></footer></body></html>").encode("utf-8")
@@ -547,6 +729,14 @@ class PortalHandler(BaseHTTPRequestHandler):
             self.dashboard_workspace(user)
         elif path.startswith("/download/"):
             self.download(user, path.removeprefix("/download/"))
+        elif path in ("/monitoramento", "/monitoramento.csv"):
+            if user["role"] != "admin":
+                self.audit(user, "acao_bloqueada", detail="abrir o monitoramento do suporte")
+                self.send_page(HTTPStatus.FORBIDDEN, "Acesso negado", "<main class='content'><h1>Área restrita à administração.</h1></main>", user)
+            elif path.endswith(".csv"):
+                self.monitoring_csv()
+            else:
+                self.monitoring_page(user)
         else:
             self.send_page(HTTPStatus.NOT_FOUND, "Página não encontrada", "<main class='content'><h1>Página não encontrada</h1></main>", user)
 
@@ -558,9 +748,10 @@ class PortalHandler(BaseHTTPRequestHandler):
             document_type = "fiscal"
         requested_store = query.get("store_id", [""])[0]
         admin = user["role"] == "admin"
+        staff = user["role"] in STAFF_ROLES
 
         with connect() as db:
-            if admin:
+            if staff:
                 stores = db.execute("SELECT id, cnpj, name FROM users WHERE role='store' AND active=1 ORDER BY name").fetchall()
                 selected_store = next((store for store in stores if str(store["id"]) == requested_store), None)
             else:
@@ -587,15 +778,24 @@ class PortalHandler(BaseHTTPRequestHandler):
         if selected_store:
             root = normalize_cnpj(selected_store["cnpj"] or "")[:8]
             units = max(1, sum(1 for store in stores if normalize_cnpj(store["cnpj"] or "")[:8] == root))
+        if selected_store:
+            self.audit(user, "abriu_loja", selected_store, document_type, competence)
+        else:
+            self.audit(user, "abriu_central", document_type=document_type)
 
         main = ""
         message = self.query_message()
         if message:
             main += f"<div class='notice' role='status'>{h(message)}</div>"
+        if user["role"] == "support":
+            main += (f"<div class='notice notice-info' role='note'>{icon('eye')}<span><strong>Acesso de suporte:</strong> consulta de todas as lojas e download de arquivos. "
+                     "Para publicar arquivos ou cadastrar lojas, fale com a administração. As ações deste acesso são registradas.</span></div>")
         if selected_store:
             main += self.page_heading(f"{label} · {subject}", selected_store["name"], f"CNPJ {format_cnpj(selected_store['cnpj'])}")
-        else:
+        elif admin:
             main += self.page_heading(f"{label} · {subject}", "Central fiscal", "Publique arquivos, cadastre lojas e acompanhe a rede.")
+        else:
+            main += self.page_heading(f"{label} · {subject}", "Central fiscal", "Escolha uma loja para consultar ou baixe os arquivos mais recentes.")
         if admin:
             main += self.admin_tools(user, stores, selected_store, document_type, competence)
         if selected_store and matrix_with_file:
@@ -618,15 +818,17 @@ class PortalHandler(BaseHTTPRequestHandler):
     def page_heading(self, kicker: str, title: str, text: str) -> str:
         return f"<div class='page-heading'><div><span class='section-kicker'>{h(kicker.upper())}</span><h1>{h(title)}</h1><p>{h(text)}</p></div></div>"
 
-    def sidebar(self, user: sqlite3.Row, stores: list[sqlite3.Row], selected_store: sqlite3.Row | None, document_type: str) -> str:
-        """Barra lateral: loja aberta, troca de loja (lista para o grupo, seletor para a administração) e tipo de SPED."""
+    def sidebar(self, user: sqlite3.Row, stores: list[sqlite3.Row], selected_store: sqlite3.Row | None, document_type: str, section: str = "documentos") -> str:
+        """Barra lateral: loja aberta, troca de loja (lista para o grupo, seletor para administração e suporte),
+        tipo de SPED e, para a administração, o monitoramento do suporte."""
         admin = user["role"] == "admin"
+        staff = user["role"] in STAFF_ROLES
         if selected_store:
             identity = f"<strong>{h(selected_store['name'])}</strong><small>CNPJ {h(format_cnpj(selected_store['cnpj']))}</small>"
         else:
-            identity = "<strong>Todas as lojas</strong><small>Visão da administração</small>"
+            identity = f"<strong>Todas as lojas</strong><small>Visão {'da administração' if admin else 'do suporte'}</small>"
         picker = ""
-        if admin:
+        if staff:
             options = "<option value=''>Todas as lojas</option>" + "".join(
                 f"<option value='{store['id']}'{' selected' if selected_store and store['id'] == selected_store['id'] else ''}>{h(store['name'])}</option>" for store in stores)
             picker = ("<form class='store-picker' method='get' action='/dashboard'><input type='hidden' name='type' value='" + h(document_type) + "'>"
@@ -635,7 +837,7 @@ class PortalHandler(BaseHTTPRequestHandler):
         card = (f"<div class='side-store{' with-picker' if picker else ''}'><div class='side-store-heading'><span class='side-store-mark'>{icon('store')}</span><span>{'LOJA ABERTA' if selected_store else 'REDE'}</span></div>"
                 f"<div class='side-store-identity'>{identity}</div>{picker}</div>")
         branches = ""
-        if not admin and len(stores) > 1:
+        if not staff and len(stores) > 1:
             short = short_store_names(stores)
             links = ""
             for store in stores:
@@ -649,10 +851,14 @@ class PortalHandler(BaseHTTPRequestHandler):
         store_id = selected_store["id"] if selected_store else None
         current = " active' aria-current='page"
         tabs = "".join(
-            f"<a class='sped-tab{current if key == document_type else ''}' href='{dashboard_link(store_id, key)}'>"
+            f"<a class='sped-tab{current if section == 'documentos' and key == document_type else ''}' href='{dashboard_link(store_id, key)}'>"
             f"<span class='tab-mark'>{mark}</span><span class='tab-text'>{label}<small>{subject}</small></span></a>"
             for key, (label, subject, mark) in DOCUMENT_TYPES.items())
         navigation = f"<nav class='sped-navigation' aria-label='Tipo de arquivo'><span class='side-section-label'>ARQUIVOS</span>{tabs}</nav>"
+        if admin:
+            navigation += (f"<nav class='sped-navigation' aria-label='Administração'><span class='side-section-label'>ADMINISTRAÇÃO</span>"
+                           f"<a class='sped-tab{current if section == 'monitoramento' else ''}' href='/monitoramento'><span class='tab-mark'>{icon('eye')}</span>"
+                           "<span class='tab-text'>Monitoramento<small>Ações do suporte</small></span></a></nav>")
         return f"<aside class='workspace-sidebar'><div class='side-overline'>PORTAL DA REDE</div>{card}{branches}{navigation}<div class='side-bottom'><span class='secure-dot'></span> Acesso protegido</div></aside>"
 
     def period_nav(self, store: sqlite3.Row, document_type: str, months: list[str], published: list[str], competence: str, units: int) -> str:
@@ -751,14 +957,107 @@ class PortalHandler(BaseHTTPRequestHandler):
         return (f"<section class='section-block'><div class='section-heading'><div><span class='section-kicker'>ÚLTIMAS PUBLICAÇÕES</span><h2>Arquivos enviados recentemente</h2></div></div>"
                 f"<div class='table-wrap'><table><thead><tr><th>LOJA</th><th>MÊS</th><th>ARQUIVO</th><th>PUBLICADO</th><th></th></tr></thead><tbody>{rows}</tbody></table></div></section>")
 
+    def monitoring_filters(self) -> tuple[str, str, str]:
+        query = parse_qs(urlparse(self.path).query)
+        period = query.get("periodo", ["7d"])[0]
+        category = query.get("acao", [""])[0]
+        return query.get("usuario", [""])[0], period if period in AUDIT_PERIODS else "7d", category if category in AUDIT_FILTERS else ""
+
+    def monitoring_page(self, user: sqlite3.Row) -> None:
+        """Tela da administração com tudo o que o suporte fez: resumo, filtros e histórico agrupado por dia."""
+        user_filter, period, category = self.monitoring_filters()
+        with connect() as db:
+            support_users = db.execute("SELECT id, name, login_name FROM users WHERE role='support' ORDER BY name").fetchall()
+            stores = db.execute("SELECT id, cnpj, name FROM users WHERE role='store' AND active=1 ORDER BY name").fetchall()
+        everything = audit_entries(user_filter, period, "", limit=None)
+        entries = audit_entries(user_filter, period, category, limit=501)
+        truncated, entries = len(entries) > 500, entries[:500]
+
+        def options(choices: dict[str, str], selected: str) -> str:
+            return "".join(f"<option value='{h(value)}'{' selected' if value == selected else ''}>{h(label)}</option>" for value, label in choices.items())
+
+        user_choices = {"": "Todos os usuários do suporte"} | {str(item["id"]): f"{item['name']} ({item['login_name']})" for item in support_users}
+        export = "/monitoramento.csv?" + "&amp;".join(f"{key}={h(value)}" for key, value in (("usuario", user_filter), ("periodo", period), ("acao", category)) if value)
+        filters = ("<form class='audit-filters' method='get' action='/monitoramento'>"
+                   f"<label>Usuário<select name='usuario'>{options(user_choices, user_filter)}</select></label>"
+                   f"<label>Período<select name='periodo'>{options({key: label for key, (label, _) in AUDIT_PERIODS.items()}, period)}</select></label>"
+                   f"<label>O que fez<select name='acao'>{options(AUDIT_FILTERS, category)}</select></label>"
+                   f"<div class='audit-filter-actions'><button class='btn btn-primary btn-sm' type='submit'>{icon('filter')}<span>Filtrar</span></button>"
+                   f"<a class='btn btn-outline btn-sm' href='{export}'>{icon('download')}<span>Exportar para Excel</span></a></div></form>")
+
+        period_label = AUDIT_PERIODS[period][0].lower()
+        stores_seen = len({entry["store_id"] for entry in everything if entry["action"] == "abriu_loja"})
+        downloads = sum(1 for entry in everything if entry["action"] == "baixou_arquivo")
+        alerts = sum(1 for entry in everything if AUDIT_ACTIONS.get(entry["action"], ("", ""))[1] == "alertas")
+        tiles = ("<div class='kpi-grid'>"
+                 + resumo_sped.kpi("Ações registradas", str(len(everything)), period_label.capitalize())
+                 + resumo_sped.kpi("Lojas consultadas", str(stores_seen), "Lojas diferentes abertas")
+                 + resumo_sped.kpi("Arquivos baixados", str(downloads), "Downloads de SPED")
+                 + resumo_sped.kpi("Alertas", str(alerts), "Senha errada ou ação bloqueada")
+                 + "</div>")
+        last_login = next((entry for entry in everything if entry["action"] == "login"), None)
+        last = ""
+        if last_login:
+            moment = datetime.fromisoformat(last_login["created_at"])
+            last = (f"<p class='period-next'>{icon('eye')}<span>Último acesso: <strong>{h(last_login['user_name'])}</strong> em <strong>{moment:%d/%m/%Y} às {moment:%H:%M}</strong>, "
+                    f"na máquina <strong>{h(last_login['machine'] or 'não identificada')}</strong> ({h(last_login['ip'])})</span></p>")
+
+        if not support_users:
+            history = ("<div class='empty-state'><span class='empty-mark'>" + icon("eye") + "</span><strong>Nenhum usuário de suporte cadastrado</strong>"
+                       "<span>Crie um com o arquivo criar-usuario-suporte.bat na pasta do portal.</span></div>")
+        elif not entries:
+            history = ("<div class='empty-state'><span class='empty-mark'>" + icon("eye") + "</span><strong>Nenhuma ação do suporte neste período</strong>"
+                       "<span>Mude o período ou o filtro para ver outros registros.</span></div>")
+        else:
+            today, rows, current_day = date.today(), "", None
+            for entry in entries:
+                moment = datetime.fromisoformat(entry["created_at"])
+                if moment.date() != current_day:
+                    current_day = moment.date()
+                    prefix = "Hoje · " if current_day == today else "Ontem · " if current_day == today - timedelta(days=1) else ""
+                    rows += f"<tr class='day-row'><td colspan='6'>{prefix}{WEEKDAYS[current_day.weekday()]}, {current_day:%d/%m/%Y}</td></tr>"
+                badge, group = AUDIT_ACTIONS.get(entry["action"], ("Ação", "consultas"))
+                sentence, extra = audit_sentence(entry)
+                store = (f"<strong>{h(entry['store_name'])}</strong><small>{h(format_cnpj(entry['store_cnpj']))}</small>" if entry["store_name"] else "<span class='muted'>—</span>")
+                machine = f"<strong>{h(entry['machine'])}</strong>" if entry["machine"] else "<span class='muted'>Não identificada</span>"
+                rows += (f"<tr><td class='mono'>{moment:%H:%M:%S}</td><td class='audit-cell'><strong>{h(entry['user_name'])}</strong><small>{h(entry['login_name'] or '')}</small></td>"
+                         f"<td class='audit-cell audit-what'><span class='audit-badge badge-{group}'>{h(badge)}</span><span><strong>{h(sentence)}</strong>{f'<small>{h(extra)}</small>' if extra else ''}</span></td>"
+                         f"<td class='audit-cell'>{store}</td><td class='audit-cell audit-machine'>{machine}<small>IP {h(entry['ip'])}</small></td><td class='audit-cell muted'>{h(entry['browser'])}</td></tr>")
+            more = "<p class='summary-note'>Mostrando as 500 ações mais recentes. Use os filtros ou exporte para Excel para ver todas.</p>" if truncated else ""
+            history = ("<div class='table-wrap audit-table'><table><thead><tr><th>HORA</th><th>USUÁRIO</th><th>O QUE FEZ</th><th>LOJA</th><th>MÁQUINA</th><th>NAVEGADOR</th></tr></thead>"
+                       f"<tbody>{rows}</tbody></table></div>{more}")
+
+        note = ("<p class='summary-note'>Horários de Brasília (horário deste servidor). A máquina é o nome do computador informado pela rede; "
+                "quando a rede não informa, aparece só o IP. Abrir a mesma tela de novo em menos de 1 minuto não gera registro repetido.</p>")
+        main = (self.page_heading("Administração", "Monitoramento do suporte", "Tudo o que os usuários do suporte fazem no portal: entradas, lojas consultadas e arquivos baixados.")
+                + filters + tiles + last
+                + "<section class='section-block'><div class='section-heading'><div><span class='section-kicker'>HISTÓRICO</span><h2>O que o suporte fez</h2></div>"
+                + f"<span class='count-badge'>{len(entries)} {'ação' if len(entries) == 1 else 'ações'}</span></div>{history}{note}</section>")
+        content = "<div class='workspace'>" + self.sidebar(user, stores, None, "fiscal", section="monitoramento") + "<main class='workspace-main'>" + main + "</main></div>"
+        self.send_page(HTTPStatus.OK, "Monitoramento do suporte", content, user)
+
+    def monitoring_csv(self) -> None:
+        """Exporta o histórico filtrado em CSV (separador ; e acentos corretos no Excel)."""
+        user_filter, period, category = self.monitoring_filters()
+        header = ("Data", "Hora", "Usuário", "Login", "Tipo", "O que fez", "Detalhe", "Loja", "CNPJ da loja", "Arquivo", "Máquina", "IP", "Navegador")
+        lines = [";".join(csv_cell(value) for value in header)]
+        for entry in audit_entries(user_filter, period, category, limit=None):
+            moment = datetime.fromisoformat(entry["created_at"])
+            sentence, extra = audit_sentence(entry)
+            values = (f"{moment:%d/%m/%Y}", f"{moment:%H:%M:%S}", entry["user_name"], entry["login_name"], AUDIT_ACTIONS.get(entry["action"], ("Ação", ""))[0], sentence, extra,
+                      entry["store_name"], format_cnpj(entry["store_cnpj"]) if entry["store_cnpj"] else "", entry["file_name"], entry["machine"] or "Não identificada", entry["ip"], entry["browser"])
+            lines.append(";".join(csv_cell(value) for value in values))
+        body = ("﻿" + "\r\n".join(lines) + "\r\n").encode("utf-8")
+        self.send_bytes(HTTPStatus.OK, body, "text/csv; charset=utf-8", {"Content-Disposition": f'attachment; filename="monitoramento-suporte-{date.today():%Y-%m-%d}.csv"'})
+
     def query_message(self) -> str:
         code = parse_qs(urlparse(self.path).query).get("status", [""])[0]
         return {"uploaded": "Arquivo validado e publicado para a loja.", "store-created": "Acesso da loja criado com sucesso.", "exists": "Este mesmo arquivo já está cadastrado para a loja e o tipo de SPED.", "invalid": "Não foi possível concluir. Confira os dados e a validação do arquivo."}.get(code, "")
 
     def download(self, user: sqlite3.Row, document_id: str) -> None:
         with connect() as db:
-            if user["role"] == "admin":
-                document = db.execute("SELECT documents.*, users.name AS store_name FROM documents JOIN users ON users.id=documents.store_id WHERE documents.id=?", (document_id,)).fetchone()
+            if user["role"] in STAFF_ROLES:
+                document = db.execute("SELECT documents.*, users.name AS store_name, users.cnpj AS store_cnpj FROM documents JOIN users ON users.id=documents.store_id WHERE documents.id=?", (document_id,)).fetchone()
             else:
                 cnpj_root = normalize_cnpj(user["cnpj"] or "")[:8]
                 document = db.execute("SELECT documents.* FROM documents JOIN users AS document_store ON document_store.id=documents.store_id WHERE documents.id=? AND document_store.role='store' AND substr(document_store.cnpj,1,8)=?", (document_id, cnpj_root)).fetchone()
@@ -771,7 +1070,34 @@ class PortalHandler(BaseHTTPRequestHandler):
             return
         body = path.read_bytes()
         filename = re.sub(r"[^A-Za-z0-9._-]", "_", Path(document["original_name"]).name)[:150] or "sped.txt"
+        if user["role"] in AUDITED_ROLES:
+            # Registra antes de enviar: o download nunca deixa de constar no histórico.
+            store = {"id": document["store_id"], "name": document["store_name"], "cnpj": document["store_cnpj"]}
+            self.audit(user, "baixou_arquivo", store, document["document_type"], document["competence"], file_name=document["original_name"])
         self.send_bytes(HTTPStatus.OK, body, "text/plain; charset=utf-8", {"Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "private, no-store"})
+
+    def audit(self, user: sqlite3.Row | dict | None, action: str, store: sqlite3.Row | dict | None = None, document_type: str | None = None,
+              competence: str | None = None, file_name: str | None = None, detail: str | None = None) -> None:
+        """Registra uma ação de um perfil monitorado (suporte): quem, o quê, qual loja, quando e de qual máquina.
+
+        Abrir a mesma tela de novo em menos de 1 minuto (recarregar, voltar) não gera registro repetido.
+        """
+        if not user or user["role"] not in AUDITED_ROLES:
+            return
+        now = datetime.now().astimezone()
+        store_id = store["id"] if store else None
+        with connect() as db:
+            if action in ("abriu_loja", "abriu_central"):
+                last = db.execute("SELECT action, store_id, document_type, competence, created_at FROM audit_log WHERE user_id=? ORDER BY id DESC LIMIT 1", (user["id"],)).fetchone()
+                if (last and (last["action"], last["store_id"], last["document_type"], last["competence"]) == (action, store_id, document_type, competence or None)
+                        and (now - datetime.fromisoformat(last["created_at"])).total_seconds() < 60):
+                    return
+            ip = self.client_address[0]
+            db.execute(
+                "INSERT INTO audit_log (created_at, user_id, user_name, login_name, action, store_id, store_name, store_cnpj, document_type, competence, file_name, detail, ip, machine, browser) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (now.isoformat(timespec="seconds"), user["id"], user["name"], user["login_name"], action, store_id, store["name"] if store else None,
+                 store["cnpj"] if store else None, document_type, competence or None, file_name, detail, ip, machine_name(ip), browser_label(self.headers.get("User-Agent", ""))))
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
@@ -792,6 +1118,7 @@ class PortalHandler(BaseHTTPRequestHandler):
         if path == "/login":
             self.login(data)
         elif path == "/logout" and user:
+            self.audit(user, "logout")
             with connect() as db:
                 db.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash(self.session_cookie),))
             self.session_cookie = None
@@ -804,6 +1131,8 @@ class PortalHandler(BaseHTTPRequestHandler):
         elif user and user["role"] == "admin" and path == "/upload":
             self.upload(data)
         else:
+            attempted = {"/upload": "publicar um arquivo SPED", "/stores": "cadastrar uma loja"}.get(path, f"uma ação não permitida ({path})")
+            self.audit(user, "acao_bloqueada", detail=attempted)
             self.send_page(HTTPStatus.FORBIDDEN, "Acesso negado", "<main class='content'><h1>Ação não autorizada.</h1></main>", user)
 
     def login(self, data: dict[str, str | bytes]) -> None:
@@ -818,17 +1147,22 @@ class PortalHandler(BaseHTTPRequestHandler):
             credential = credential.strip() if isinstance(credential, str) else ""
             cnpj = normalize_cnpj(credential)
             password = password if isinstance(password, str) else ""
-            account = db.execute("SELECT * FROM users WHERE active=1 AND ((role='store' AND cnpj=?) OR (role='admin' AND login_name=?))", (cnpj, credential.lower())).fetchone()
-            if not account or not verify_password(password, account["password_hash"]):
+            account = db.execute("SELECT * FROM users WHERE active=1 AND ((role='store' AND cnpj=?) OR (role IN ('admin', 'support') AND login_name=?))", (cnpj, credential.lower())).fetchone()
+            failed = not account or not verify_password(password, account["password_hash"])
+            if failed:
                 attempts = attempt["attempts"] + 1 if attempt and attempt["window_start"] > now - 900 else 1
                 db.execute("INSERT INTO login_attempts VALUES (?, ?, ?) ON CONFLICT(ip) DO UPDATE SET attempts=excluded.attempts, window_start=excluded.window_start", (ip, attempts, attempt["window_start"] if attempt and attempt["window_start"] > now - 900 else now))
-                self.send_login_page(HTTPStatus.UNAUTHORIZED, "CNPJ ou senha incorretos. Confira e tente novamente.", credential)
-                return
+        if failed:
+            self.audit(account, "login_falhou")
+            self.send_login_page(HTTPStatus.UNAUTHORIZED, "CNPJ ou senha incorretos. Confira e tente novamente.", credential)
+            return
+        with connect() as db:
             db.execute("DELETE FROM login_attempts WHERE ip=?", (ip,))
             raw_token = secrets.token_urlsafe(32)
             csrf = secrets.token_urlsafe(24)
             db.execute("DELETE FROM sessions WHERE user_id=?", (account["id"],))
             db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (token_hash(raw_token), account["id"], csrf, now + SESSION_SECONDS))
+        self.audit(account, "login")
         self.session_cookie = raw_token
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", "/dashboard")
@@ -916,6 +1250,30 @@ def main() -> None:
             raise SystemExit(str(error)) from error
         print("Administrador criado. Inicie o portal com: python app.py")
         return
+    if len(sys.argv) > 1 and sys.argv[1] == "criar-suporte":
+        # python app.py criar-suporte [usuario] [nome] [--salvar-em arquivo.txt]
+        args = sys.argv[2:]
+        target = None
+        if "--salvar-em" in args:
+            position = args.index("--salvar-em")
+            target = Path(args[position + 1]) if position + 1 < len(args) else None
+            args = args[:position] + args[position + 2:]
+        login_name = (args[0] if args else input("Usuário do suporte (ex.: suporte): ")).strip().lower() or "suporte"
+        name = args[1] if len(args) > 1 else "Suporte Farmácias Associadas"
+        try:
+            password = create_support_user(login_name, name)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
+        print(f"Usuário de suporte criado: {login_name} ({name})")
+        print(f"Senha: {password}")
+        print("Acesso: todas as lojas, somente consulta e download. As ações ficam registradas no monitoramento da administração.")
+        if target:
+            block = (f"\nPORTAL FISCAL - ACESSO SUPORTE\nUsuário: {login_name}\nSenha: {password}\n"
+                     "Perfil: consulta de todas as lojas e download de arquivos. Não publica nem cadastra. Ações registradas no monitoramento.\n")
+            with open(target, "a", encoding="utf-8") as handle:
+                handle.write(block)
+            print(f"Credencial adicionada em: {target}")
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "redefinir-senha":
         cnpj = sys.argv[2] if len(sys.argv) > 2 else input("CNPJ da loja: ")
         try:
@@ -923,7 +1281,7 @@ def main() -> None:
         except ValueError as error:
             raise SystemExit(str(error)) from error
         print(f"Loja: {name}")
-        print(f"CNPJ: {format_cnpj(cnpj)}")
+        print(f"CNPJ: {format_cnpj(cnpj)}" if len(normalize_cnpj(cnpj)) == 14 else f"Usuário: {cnpj.strip().lower()}")
         print(f"Nova senha: {password}")
         print("Sessões antigas encerradas e bloqueios de tentativa liberados.")
         return
