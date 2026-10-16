@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Iterator
 from urllib.parse import parse_qs, urlparse
 
+import resumo_sped
+
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("PORTAL_DATA_DIR", ROOT / "data"))
@@ -29,6 +31,9 @@ DOCUMENTS = DATA_DIR / "documentos"
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024
 PASSWORD_ITERATIONS = 600_000
 SESSION_SECONDS = 8 * 60 * 60
+LOGIN_FORM_SECONDS = 2 * 60 * 60
+# Senhas geradas pelo portal: sem caracteres que se confundem ao ler ou digitar (0/O, 1/l/I).
+READABLE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
 APP_SECRET: bytes | None = None
 
 
@@ -137,6 +142,12 @@ def initialize_database() -> None:
                 db.execute("""INSERT INTO documents (id, store_id, document_type, competence, original_name, size, sha256, uploaded_at)
                     SELECT id, store_id, 'fiscal', competence, original_name, size, sha256, uploaded_at FROM documents_legacy""")
             db.execute("DROP TABLE documents_legacy")
+        db.execute("""CREATE TABLE IF NOT EXISTS document_summaries (
+            document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+            version INTEGER NOT NULL,
+            summary TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
 
 
 def normalize_cnpj(value: str) -> str:
@@ -215,6 +226,44 @@ def create_user(cnpj: str | None, name: str, role: str, password: str, login_nam
         )
 
 
+def reset_store_password(cnpj: str) -> tuple[str, str]:
+    """Gera uma senha nova para a loja, encerra as sessões dela e libera bloqueios de tentativas de login."""
+    normalized = normalize_cnpj(cnpj)
+    password = "-".join("".join(secrets.choice(READABLE_ALPHABET) for _ in range(4)) for _ in range(3))
+    with connect() as db:
+        store = db.execute("SELECT id, name FROM users WHERE role='store' AND cnpj=?", (normalized,)).fetchone()
+        if not store:
+            raise ValueError("Nenhuma loja cadastrada com esse CNPJ.")
+        db.execute("UPDATE users SET password_hash=?, active=1 WHERE id=?", (password_digest(password), store["id"]))
+        db.execute("DELETE FROM sessions WHERE user_id=?", (store["id"],))
+        db.execute("DELETE FROM login_attempts")
+    return store["name"], password
+
+
+def document_summary(document: sqlite3.Row) -> dict | None:
+    """Resumo agregado de um SPED publicado, calculado uma vez e guardado no banco."""
+    with connect() as db:
+        cached = db.execute("SELECT summary FROM document_summaries WHERE document_id=? AND version=?", (document["id"], resumo_sped.SUMMARY_VERSION)).fetchone()
+    if cached:
+        return json.loads(cached["summary"])
+    path = DOCUMENTS / (document["id"] + ".txt")
+    if not path.is_file():
+        return None
+    try:
+        summary = resumo_sped.summarize(path, document["document_type"])
+    except (OSError, ValueError, IndexError):
+        return None
+    with connect() as db:
+        db.execute("INSERT INTO document_summaries (document_id, version, summary, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(document_id) DO UPDATE SET version=excluded.version, summary=excluded.summary, created_at=excluded.created_at",
+                   (document["id"], resumo_sped.SUMMARY_VERSION, json.dumps(summary, ensure_ascii=False), datetime.now(timezone.utc).isoformat()))
+    return summary
+
+
+def competence_summary(documents: list[sqlite3.Row], competence: str) -> dict | None:
+    published = sorted((doc for doc in documents if doc["competence"] == competence), key=lambda doc: doc["uploaded_at"])
+    return resumo_sped.merge([summary for summary in (document_summary(doc) for doc in published) if summary])
+
+
 def ensure_secret() -> bytes:
     global APP_SECRET
     if APP_SECRET is None:
@@ -231,10 +280,129 @@ def h(value: object) -> str:
     return html.escape(str(value), quote=True)
 
 
+# Tipos de SPED: rótulo, o que o arquivo apura e a letra do ícone da aba.
+DOCUMENT_TYPES = {
+    "fiscal": ("SPED Fiscal", "ICMS e IPI", "F"),
+    "contribuicoes": ("SPED Contribuições", "PIS e COFINS", "C"),
+}
+
+# Ícones de traço (24x24) desenhados em SVG inline: nítidos em qualquer tela e permitidos pela CSP.
+ICONS = {
+    "download": "<path d='M12 4v11'/><path d='m7 10 5 5 5-5'/><path d='M5 20h14'/>",
+    "logout": "<path d='M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3'/><path d='m10 16 4-4-4-4'/><path d='M14 12H4'/>",
+    "store": "<path d='M4 10v10h16V10'/><path d='m3 10 2-6h14l2 6'/><path d='M9 20v-6h6v6'/>",
+    "file": "<path d='M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z'/><path d='M14 3v5h5'/>",
+    "arrow": "<path d='M5 12h14'/><path d='m13 6 6 6-6 6'/>",
+    "upload": "<path d='M12 20V9'/><path d='m7 14 5-5 5 5'/><path d='M5 4h14'/>",
+    "plus": "<path d='M12 5v14'/><path d='M5 12h14'/>",
+    "lock": "<rect x='5' y='11' width='14' height='9' rx='2'/><path d='M8 11V8a4 4 0 0 1 8 0v3'/>",
+    "calendar": "<rect x='4' y='5' width='16' height='15' rx='2'/><path d='M4 10h16'/><path d='M9 3v4'/><path d='M15 3v4'/>",
+}
+
+
+def icon(name: str) -> str:
+    return f"<svg class='icon' viewBox='0 0 24 24' aria-hidden='true' focusable='false'>{ICONS[name]}</svg>"
+
+
+def format_cnpj(value: str | None) -> str:
+    digits = normalize_cnpj(value or "")
+    return f"{digits[:2]}.{digits[2:5]}.{digits[5:8]}/{digits[8:12]}-{digits[12:]}" if len(digits) == 14 else (value or "")
+
+
+def dashboard_link(store_id: int | None = None, document_type: str = "fiscal", competence: str = "") -> str:
+    """Endereço do painel para uma loja, tipo de SPED e mês (já escapado para uso em atributo HTML)."""
+    params = ([f"store_id={store_id}"] if store_id else []) + [f"type={document_type}"] + ([f"competence={competence}"] if competence else [])
+    return "/dashboard?" + "&amp;".join(params)
+
+
+# Previsão de publicação: os meses aparecem no painel até FORECAST_UNTIL, e cada arquivo
+# do mês tem prazo no N-ésimo dia útil do mês seguinte, conforme o tamanho do grupo.
+FORECAST_UNTIL = os.environ.get("PORTAL_PREVISAO_ATE", "2026-12")
+SMALL_GROUP_UNITS = 3
+SMALL_GROUP_BUSINESS_DAY = 3
+LARGE_GROUP_BUSINESS_DAY = 5
+LARGE_GROUP_NOTE = ("Por conta do número de lojas, a demanda requer mais tempo para conclusão e postagem. "
+                    "Se algum arquivo precisar de correção, ele entra na fila e é postado após a conclusão das postagens obrigatórias e regulares.")
+
+
+def easter(year: int) -> date:
+    """Domingo de Páscoa (algoritmo gregoriano anônimo)."""
+    a, b, c = year % 19, year // 100, year % 100
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h_ = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    l_ = (32 + 2 * e + 2 * i - h_ - k) % 7
+    m = (a + 11 * h_ + 22 * l_) // 451
+    month, day = divmod(h_ + l_ - 7 * m + 114, 31)
+    return date(year, month, day + 1)
+
+
+def non_business_days(year: int) -> set[date]:
+    """Feriados nacionais, Carnaval e Sexta-feira Santa. Feriados estaduais e municipais não entram."""
+    fixed = {date(year, month, day) for month, day in ((1, 1), (4, 21), (5, 1), (9, 7), (10, 12), (11, 2), (11, 15), (11, 20), (12, 25))}
+    sunday = easter(year)
+    return fixed | {sunday - timedelta(days=48), sunday - timedelta(days=47), sunday - timedelta(days=2)}
+
+
+def business_day(year: int, month: int, nth: int) -> date:
+    holidays = non_business_days(year)
+    day, found = date(year, month, 1), 0
+    while True:
+        if day.weekday() < 5 and day not in holidays:
+            found += 1
+            if found == nth:
+                return day
+        day += timedelta(days=1)
+
+
+def next_competence(competence: str) -> str:
+    year, month = int(competence[:4]), int(competence[5:7])
+    return f"{year + 1}-01" if month == 12 else f"{year}-{month + 1:02d}"
+
+
+def publication_deadline(competence: str, units: int) -> tuple[date, int]:
+    """Prazo de publicação do SPED de um mês: 3º dia útil do mês seguinte para grupos de até 3 lojas, 5º para os maiores."""
+    nth = SMALL_GROUP_BUSINESS_DAY if units <= SMALL_GROUP_UNITS else LARGE_GROUP_BUSINESS_DAY
+    following = next_competence(competence)
+    return business_day(int(following[:4]), int(following[5:7]), nth), nth
+
+
+def competence_timeline(published: list[str], today: date | None = None) -> list[str]:
+    """Meses exibidos no painel: dos publicados (ou do mês anterior) até o fim da previsão, no máximo 15."""
+    today = today or date.today()
+    previous = (today.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    month, end = min(published + [previous]), max(published + [FORECAST_UNTIL])
+    months = []
+    while month <= end:
+        months.append(month)
+        month = next_competence(month)
+    return months[-15:]
+
+
+def help_tip(text: str) -> str:
+    """Ícone "?" que mostra a explicação ao passar o mouse, tocar ou focar pelo teclado."""
+    return f"<span class='help' tabindex='0' role='note' aria-label='{h(text)}'>?<span class='help-tip' aria-hidden='true'>{h(text)}</span></span>"
+
+
+def file_size(size: int) -> str:
+    return f"{size / 1024 / 1024:.1f} MB".replace(".", ",") if size >= 1024 * 1024 else f"{max(1, round(size / 1024))} KB"
+
+
+def short_store_names(stores: list[sqlite3.Row]) -> dict[int, str]:
+    """Nomes curtos para as lojas de um mesmo grupo, sem a parte repetida da razão social.
+
+    "FARMACIA EXEMPLO LTDA - VR" vira "VR"; "LOJA 2 - DROGARIA X LTDA" vira "LOJA 2".
+    """
+    return dict(zip((store["id"] for store in stores), resumo_sped.short_labels([store["name"].strip() for store in stores])))
+
+
 def render_page(title: str, content: str, user: sqlite3.Row | None = None) -> bytes:
     nav = ""
     if user:
-        nav = f"<div class='user-chip'><span class='user-mark'>{h(user['name'][:1].upper())}</span><span>{h(user['name'])}<small>{'Administração' if user['role'] == 'admin' else 'Acesso da loja'}</small></span><form method='post' action='/logout'><input type='hidden' name='csrf' value='{h(user['csrf_token'])}'><button class='icon-button' title='Sair' aria-label='Sair'>↗</button></form></div>"
+        nav = (f"<div class='user-chip'><span class='user-mark'>{h(user['name'][:1].upper())}</span><span class='user-text'>{h(user['name'])}<small>{'Administração' if user['role'] == 'admin' else 'Acesso da loja'}</small></span>"
+               f"<form method='post' action='/logout'><input type='hidden' name='csrf' value='{h(user['csrf_token'])}'><button class='btn btn-ghost btn-sm' type='submit'>{icon('logout')}<span>Sair</span></button></form></div>")
     brand = "<a class='brand' href='/dashboard'><img class='brand-logo' src='/static/farmacias-associadas-logo.png' alt='Farmácias Associadas'><span class='brand-context'>PORTAL FISCAL</span></a>"
     return (f"<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='theme-color' content='#087e70'><title>{h(title)} · Portal Fiscal</title><link rel='stylesheet' href='/static/styles.css'></head><body><header class='topbar'>{brand}{nav}</header>{content}<footer class='site-footer'><span>PORTAL FISCAL <i></i> FARMÁCIAS ASSOCIADAS</span><span>Documentos acessíveis somente à loja autorizada.</span></footer></body></html>").encode("utf-8")
 
@@ -279,10 +447,32 @@ class PortalHandler(BaseHTTPRequestHandler):
         cookie = self.cookies().get("login_nonce")
         return cookie.value if cookie else ""
 
-    def issue_login_nonce(self) -> tuple[str, str]:
-        nonce = secrets.token_urlsafe(24)
-        mac = hmac.new(ensure_secret(), nonce.encode(), hashlib.sha256).hexdigest()
-        return nonce, mac
+    def login_token(self) -> tuple[str, str]:
+        """Código de segurança do formulário de login.
+
+        Reaproveita o código que o navegador já tem: assim uma aba extra, o pré-carregamento
+        da página pelo navegador ou um recarregamento não invalidam o formulário já aberto.
+        """
+        nonce = self.login_nonce()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{32}", nonce):
+            nonce = secrets.token_urlsafe(24)
+        return nonce, hmac.new(ensure_secret(), nonce.encode(), hashlib.sha256).hexdigest()
+
+    def send_login_page(self, status: int = HTTPStatus.OK, message: str = "", credential: str = "") -> None:
+        """Tela de acesso. Com mensagem, mostra o erro acima do formulário e mantém o CNPJ digitado."""
+        nonce, csrf = self.login_token()
+        notice = f"<div class='notice notice-error' role='alert'>{h(message)}</div>" if message else ""
+        kicker = "TENTE NOVAMENTE" if message else "BEM-VINDA, LOJA"
+        content = ("<main class='login-layout'><section class='login-brand'><div class='eyebrow'>ÁREA EXCLUSIVA</div><h1>Fiscal em dia.<br><em>Sem complicação.</em></h1>"
+                   "<p>Seus arquivos fiscais, organizados por competência e protegidos em um só lugar.</p><div class='login-foot'>ACESSO SEGURO <i></i> FARMÁCIAS ASSOCIADAS</div></section>"
+                   f"<section class='login-panel'>{notice}<div class='login-heading'><span class='section-kicker'>{kicker}</span><h2>Acesse seu portal</h2><p>Entre com o CNPJ cadastrado e sua senha.</p></div>"
+                   f"<form method='post' action='/login' class='stack-form'><input type='hidden' name='csrf' value='{h(csrf)}'>"
+                   f"<label>CNPJ ou usuário<input name='cnpj' autocomplete='username' placeholder='CNPJ da loja ou usuário admin' maxlength='40' value='{h(credential)}' required></label>"
+                   "<label>Senha<input name='password' type='password' autocomplete='current-password' placeholder='Sua senha de acesso' required></label>"
+                   "<button class='button button-primary button-wide'>Entrar no portal <span>→</span></button></form>"
+                   "<div class='login-note'><span class='lock-icon'>▣</span> Conexão protegida. Seus arquivos são privados.</div></section></main>")
+        cookie = f"login_nonce={nonce}; Path=/; HttpOnly; SameSite=Strict; Max-Age={LOGIN_FORM_SECONDS}" + ("; Secure" if os.environ.get("COOKIE_SECURE") == "1" else "")
+        self.send_bytes(status, render_page("Acesso", content), headers={"Set-Cookie": cookie})
 
     def get_user(self) -> sqlite3.Row | None:
         cookie = self.cookies().get("portal_session")
@@ -345,9 +535,7 @@ class PortalHandler(BaseHTTPRequestHandler):
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
                 return
-            nonce, csrf = self.issue_login_nonce()
-            content = "<main class='login-layout'><section class='login-brand'><div class='eyebrow'>ÁREA EXCLUSIVA</div><h1>Fiscal em dia.<br><em>Sem complicação.</em></h1><p>Seus arquivos fiscais, organizados por competência e protegidos em um só lugar.</p><div class='login-foot'>ACESSO SEGURO <i></i> FARMÁCIAS ASSOCIADAS</div></section><section class='login-panel'><div class='login-heading'><span class='section-kicker'>BEM-VINDA, LOJA</span><h2>Acesse seu portal</h2><p>Entre com o CNPJ cadastrado e sua senha.</p></div><form method='post' action='/login' class='stack-form'><input type='hidden' name='csrf' value='" + h(csrf) + "'><label>CNPJ ou usuário<input name='cnpj' autocomplete='username' placeholder='CNPJ da loja ou usuário admin' maxlength='40' required></label><label>Senha<input name='password' type='password' autocomplete='current-password' placeholder='Sua senha de acesso' required></label><button class='button button-primary button-wide'>Entrar no portal <span>→</span></button></form><div class='login-note'><span class='lock-icon'>▣</span> Conexão protegida. Seus arquivos são privados.</div></section></main>"
-            self.send_bytes(HTTPStatus.OK, render_page("Acesso", content), headers={"Set-Cookie": f"login_nonce={nonce}; Path=/; HttpOnly; SameSite=Strict; Max-Age=600" + ("; Secure" if os.environ.get("COOKIE_SECURE") == "1" else "")})
+            self.send_login_page()
             return
         user = self.get_user()
         if not user:
@@ -362,90 +550,206 @@ class PortalHandler(BaseHTTPRequestHandler):
         else:
             self.send_page(HTTPStatus.NOT_FOUND, "Página não encontrada", "<main class='content'><h1>Página não encontrada</h1></main>", user)
 
-    def dashboard(self, user: sqlite3.Row) -> None:
-        with connect() as db:
-            if user["role"] == "admin":
-                stores = db.execute("SELECT users.id, users.cnpj, users.name, COUNT(documents.id) AS total FROM users LEFT JOIN documents ON documents.store_id=users.id WHERE users.role='store' GROUP BY users.id ORDER BY users.name").fetchall()
-                documents = db.execute("SELECT documents.*, users.name AS store_name, users.cnpj FROM documents JOIN users ON users.id=documents.store_id ORDER BY competence DESC, store_name LIMIT 50").fetchall()
-            else:
-                stores = []
-                documents = db.execute("SELECT * FROM documents WHERE store_id=? ORDER BY competence DESC", (user["id"],)).fetchall()
-        content = "<main class='content'><div class='page-heading'><div><span class='section-kicker'>VISÃO GERAL</span><h1>" + ("Central fiscal" if user["role"] == "admin" else "Seus documentos") + "</h1><p>" + ("Gerencie lojas e disponibilize arquivos por competência." if user["role"] == "admin" else "Arquivos fiscais da sua loja, organizados por período.") + "</p></div><span class='date-stamp'>" + h(datetime.now().strftime("%d.%m.%Y")) + "</span></div>"
-        if user["role"] == "admin":
-            content += "<section class='admin-grid'><div class='panel upload-panel'><div class='panel-title'><span class='panel-icon upload-icon'>↑</span><div><span class='section-kicker'>NOVO ARQUIVO</span><h2>Disponibilizar SPED</h2></div></div><p class='panel-copy'>O CNPJ e a competência são conferidos diretamente no registro 0000.</p><form method='post' enctype='multipart/form-data' action='/upload' class='stack-form'><input type='hidden' name='csrf' value='" + h(user["csrf_token"]) + "'><label>Loja destinatária<select name='store_id' required><option value=''>Selecione a loja</option>" + "".join(f"<option value='{store['id']}'>{h(store['name'])} · {h(store['cnpj'])}</option>" for store in stores) + "</select></label><label>Competência<input name='competence' type='month' required></label><label>Arquivo SPED EFD<input class='file-input' name='file' type='file' accept='.txt,text/plain' required><small class='field-help'>Arquivo .txt · até 40 MB · somente texto</small></label><button class='button button-primary'>Validar e publicar <span>→</span></button></form></div><div class='panel store-panel'><div class='panel-title'><span class='panel-icon store-icon'>＋</span><div><span class='section-kicker'>ACESSOS</span><h2>Cadastrar loja</h2></div></div><p class='panel-copy'>Crie o acesso privado da farmácia à plataforma.</p><form method='post' action='/stores' class='stack-form'><input type='hidden' name='csrf' value='" + h(user["csrf_token"]) + "'><label>Nome da loja<input name='name' maxlength='120' placeholder='Ex.: Farmácia Central' required></label><label>CNPJ<input name='cnpj' inputmode='numeric' maxlength='18' placeholder='00.000.000/0000-00' required></label><label>Senha inicial<input name='password' type='password' minlength='12' autocomplete='new-password' placeholder='Mínimo de 12 caracteres' required></label><button class='button button-outline'>Criar acesso <span>→</span></button></form></div></section><section class='section-block'><div class='section-heading'><div><span class='section-kicker'>REDE</span><h2>Lojas cadastradas</h2></div><span class='count-badge'>" + str(len(stores)) + " lojas</span></div><div class='table-wrap'><table><thead><tr><th>LOJA</th><th>CNPJ</th><th>ARQUIVOS</th><th>ACESSO</th></tr></thead><tbody>" + ("".join(f"<tr><td class='store-name'>{h(store['name'])}</td><td class='mono'>{h(store['cnpj'])}</td><td>{store['total']} <span class='muted'>documentos</span></td><td><span class='status-active'><i></i> Ativo</span></td></tr>" for store in stores) or "<tr><td colspan='4' class='empty-cell'>Nenhuma loja cadastrada. Crie o primeiro acesso acima.</td></tr>") + "</tbody></table></div></section>"
-        content += "<section class='section-block documents-block'><div class='section-heading'><div><span class='section-kicker'>ARQUIVO FISCAL</span><h2>Últimos documentos</h2></div><span class='count-badge'>" + str(len(documents)) + " itens</span></div>" + self.documents_table(documents, user["role"] == "admin") + "</section>"
-        message = self.query_message()
-        if message:
-            content = content.replace("<main class='content'>", f"<main class='content'><div class='notice'>{h(message)}</div>", 1)
-        content += "</main>"
-        self.send_page(HTTPStatus.OK, "Central fiscal", content, user)
-
-    def documents_table(self, documents: list[sqlite3.Row], admin: bool) -> str:
-        if not documents:
-            return "<div class='empty-state'><span class='empty-mark'>—</span><strong>Nenhum arquivo por aqui ainda</strong><span>Os documentos publicados aparecerão nesta lista.</span></div>"
-        rows = "".join(f"<tr><td class='store-name'>{h(doc['store_name'])}</td>" if admin else "<tr>" for doc in documents)
-        rows = "".join((f"<tr><td class='store-name'>{h(doc['store_name'])}</td>" if admin else "<tr>") + f"<td><span class='month-tag'>{h(doc['competence'][5:7] + '/' + doc['competence'][:4])}</span></td><td class='file-name'>{h(doc['original_name'])}</td><td class='muted'>{h(datetime.fromisoformat(doc['uploaded_at']).strftime('%d/%m/%Y'))}</td><td><a class='download-link' href='/download/{h(doc['id'])}' title='Baixar arquivo' aria-label='Baixar {h(doc['original_name'])}'>↓</a></td></tr>" for doc in documents)
-        columns = "<th>LOJA</th>" if admin else ""
-        return f"<div class='table-wrap'><table><thead><tr>{columns}<th>COMPETÊNCIA</th><th>ARQUIVO</th><th>PUBLICADO</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>"
-
     def dashboard_workspace(self, user: sqlite3.Row) -> None:
+        """Tela principal: barra lateral (loja e tipo de SPED) e área de trabalho da loja ou da rede."""
         query = parse_qs(urlparse(self.path).query)
         document_type = query.get("type", ["fiscal"])[0]
-        if document_type not in ("fiscal", "contribuicoes"):
+        if document_type not in DOCUMENT_TYPES:
             document_type = "fiscal"
-        type_label = "SPED Fiscal" if document_type == "fiscal" else "SPED Contribuições"
         requested_store = query.get("store_id", [""])[0]
+        admin = user["role"] == "admin"
 
         with connect() as db:
-            if user["role"] == "admin":
+            if admin:
                 stores = db.execute("SELECT id, cnpj, name FROM users WHERE role='store' AND active=1 ORDER BY name").fetchall()
                 selected_store = next((store for store in stores if str(store["id"]) == requested_store), None)
-                if selected_store:
-                    documents = db.execute("SELECT documents.*, users.name AS store_name, users.cnpj FROM documents JOIN users ON users.id=documents.store_id WHERE documents.store_id=? AND documents.document_type=? ORDER BY competence DESC", (selected_store["id"], document_type)).fetchall()
-                else:
-                    selected_store = None
-                    documents = db.execute("SELECT documents.*, users.name AS store_name, users.cnpj FROM documents JOIN users ON users.id=documents.store_id WHERE documents.document_type=? ORDER BY competence DESC, store_name LIMIT 100", (document_type,)).fetchall()
-                store_rows = db.execute("SELECT users.id, users.cnpj, users.name, COUNT(documents.id) AS total FROM users LEFT JOIN documents ON documents.store_id=users.id WHERE users.role='store' AND users.active=1 GROUP BY users.id ORDER BY users.name").fetchall()
             else:
                 cnpj_root = normalize_cnpj(user["cnpj"] or "")[:8]
                 stores = db.execute("SELECT id, cnpj, name FROM users WHERE role='store' AND active=1 AND substr(cnpj,1,8)=? ORDER BY CASE WHEN substr(cnpj,9,4)='0001' THEN 0 ELSE 1 END, name", (cnpj_root,)).fetchall()
-                selected_store = next((store for store in stores if str(store["id"]) == requested_store), None)
-                if selected_store is None:
-                    selected_store = next((store for store in stores if store["id"] == user["id"]), user)
-                documents = db.execute("SELECT * FROM documents WHERE store_id=? AND document_type=? ORDER BY competence DESC, original_name", (selected_store["id"], document_type)).fetchall()
-                store_rows = []
+                selected_store = next((store for store in stores if str(store["id"]) == requested_store), None) or next((store for store in stores if store["id"] == user["id"]), user)
+            store_rows: list[sqlite3.Row] = []
+            matrix_with_file = None
+            if selected_store:
+                documents = db.execute("SELECT * FROM documents WHERE store_id=? AND document_type=? ORDER BY competence DESC, uploaded_at DESC", (selected_store["id"], document_type)).fetchall()
+                if not documents and document_type == "contribuicoes":
+                    # O SPED Contribuições é entregue pela matriz e inclui as filiais.
+                    matrix_with_file = db.execute("SELECT DISTINCT users.id, users.name FROM users JOIN documents ON documents.store_id=users.id WHERE users.role='store' AND users.active=1 AND substr(users.cnpj,1,8)=? AND users.id<>? AND documents.document_type='contribuicoes' ORDER BY substr(users.cnpj,9,4) LIMIT 1", (normalize_cnpj(selected_store["cnpj"] or "")[:8], selected_store["id"])).fetchone()
+            else:
+                documents = db.execute("SELECT documents.*, users.name AS store_name FROM documents JOIN users ON users.id=documents.store_id WHERE documents.document_type=? ORDER BY documents.uploaded_at DESC LIMIT 20", (document_type,)).fetchall()
+                store_rows = db.execute("SELECT users.id, users.cnpj, users.name, COUNT(documents.id) AS total FROM users LEFT JOIN documents ON documents.store_id=users.id AND documents.document_type=? WHERE users.role='store' AND users.active=1 GROUP BY users.id ORDER BY users.name", (document_type,)).fetchall()
 
-        store_identity = "<strong>Todas as lojas</strong><small>Visão administrativa</small>"
+        label, subject, _ = DOCUMENT_TYPES[document_type]
+        competences = sorted({doc["competence"] for doc in documents}, reverse=True) if selected_store else []
+        months = competence_timeline(competences) if selected_store and not matrix_with_file else []
+        requested_competence = query.get("competence", [""])[0]
+        competence = requested_competence if requested_competence in months else (competences[0] if competences else (months[0] if months else ""))
+        units = 1
         if selected_store:
-            store_identity = f"<strong>{h(selected_store['name'])}</strong><small class='store-cnpj'>CNPJ {h(selected_store['cnpj'])}</small>"
-        store_picker = ""
-        if user["role"] == "admin" or len(stores) > 1:
-            selector_label = "Selecionar loja" if user["role"] == "admin" else "Trocar filial"
-            all_option = "<option value=''>Todas as lojas</option>" if user["role"] == "admin" else ""
-            store_picker = "<form class='store-picker' method='get' action='/dashboard'><input type='hidden' name='type' value='" + h(document_type) + "'><label for='store_id'>" + selector_label + "</label><select id='store_id' name='store_id'>" + all_option + "".join(f"<option value='{store['id']}'{' selected' if selected_store and store['id'] == selected_store['id'] else ''}>{h(store['name'])} · {h(store['cnpj'])}</option>" for store in stores) + "</select><button class='store-trigger' type='submit'>" + ("Loja" if user["role"] == "admin" else "Abrir filial") + " <span>→</span></button></form>"
-        tabs = "".join(
-            f"<a class='sped-tab{' active' if document_type == key else ''}' href='/dashboard?{('store_id=' + str(selected_store['id']) + '&') if selected_store and (user['role'] == 'admin' or user['role'] == 'store') else ''}type={key}'><span class='tab-mark'>{mark}</span>{label}</a>"
-            for key, label, mark in (("fiscal", "SPED Fiscal", "F"), ("contribuicoes", "SPED Contribuições", "C"))
-        )
-        sidebar = "<aside class='workspace-sidebar'><div class='side-overline'>PORTAL DA REDE</div><div class='side-store'><div class='side-store-heading'><span class='side-store-mark'>⌂</span><span>LOJA</span></div><div class='side-store-identity'>" + store_identity + "</div>" + store_picker + "</div><nav class='sped-navigation' aria-label='Tipo de arquivo'><span class='side-section-label'>DOCUMENTOS</span>" + tabs + "</nav><div class='side-bottom'><span class='secure-dot'></span> Acesso protegido</div></aside>"
+            root = normalize_cnpj(selected_store["cnpj"] or "")[:8]
+            units = max(1, sum(1 for store in stores if normalize_cnpj(store["cnpj"] or "")[:8] == root))
 
-        content = "<div class='workspace'>" + sidebar + "<main class='workspace-main'><div class='page-heading'><div><span class='section-kicker'>ARQUIVO FISCAL</span><h1>" + h(selected_store["name"] if selected_store else "Central fiscal") + "</h1><p>" + ("Consulte documentos da loja selecionada." if selected_store else "Selecione uma loja ou consulte a rede inteira.") + "</p></div><span class='date-stamp'>" + h(datetime.now().strftime("%d.%m.%Y")) + "</span></div>"
-        if user["role"] == "admin":
-            content += "<section class='admin-grid'><div class='panel upload-panel'><div class='panel-title'><span class='panel-icon upload-icon'>↑</span><div><span class='section-kicker'>NOVO ARQUIVO · " + h(type_label.upper()) + "</span><h2>Disponibilizar documento</h2></div></div><p class='panel-copy'>CNPJ, período e tipo do SPED serão conferidos antes da publicação.</p><form method='post' enctype='multipart/form-data' action='/upload' class='stack-form'><input type='hidden' name='csrf' value='" + h(user["csrf_token"]) + "'><input type='hidden' name='document_type' value='" + h(document_type) + "'><label>Loja destinatária<select name='store_id' required><option value=''>Selecione a loja</option>" + "".join(f"<option value='{store['id']}'>{h(store['name'])} · {h(store['cnpj'])}</option>" for store in stores) + "</select></label><label>Competência<input name='competence' type='month' required></label><label>Arquivo .txt<input class='file-input' name='file' type='file' accept='.txt,text/plain' required><small class='field-help'>Até 40 MB · CNPJ e competência devem corresponder à loja.</small></label><button class='button button-primary'>Validar e publicar <span>→</span></button></form></div><div class='panel store-panel'><div class='panel-title'><span class='panel-icon store-icon'>＋</span><div><span class='section-kicker'>ACESSOS</span><h2>Cadastrar loja</h2></div></div><p class='panel-copy'>Crie o acesso privado da farmácia à plataforma.</p><form method='post' action='/stores' class='stack-form'><input type='hidden' name='csrf' value='" + h(user["csrf_token"]) + "'><label>Nome da loja<input name='name' maxlength='120' placeholder='Ex.: Farmácia Central' required></label><label>CNPJ<input name='cnpj' inputmode='numeric' maxlength='18' placeholder='00.000.000/0000-00' required></label><label>Senha inicial<input name='password' type='password' minlength='12' autocomplete='new-password' placeholder='Mínimo de 12 caracteres' required></label><button class='button button-outline'>Criar acesso <span>→</span></button></form></div></section>"
-            content += "<section class='section-block'><div class='section-heading'><div><span class='section-kicker'>REDE</span><h2>Lojas cadastradas</h2></div><span class='count-badge'>" + str(len(store_rows)) + " lojas</span></div><div class='table-wrap'><table><thead><tr><th>LOJA</th><th>CNPJ</th><th>ABRIR</th></tr></thead><tbody>" + ("".join(f"<tr><td class='store-name'>{h(store['name'])}</td><td class='mono'>{h(store['cnpj'])}</td><td><a class='store-open-link' href='/dashboard?store_id={store['id']}&type={document_type}'>Ver documentos →</a></td></tr>" for store in store_rows) or "<tr><td colspan='3' class='empty-cell'>Nenhuma loja cadastrada ainda.</td></tr>") + "</tbody></table></div></section>"
-        content += "<section class='section-block documents-block'><div class='section-heading'><div><span class='section-kicker'>" + h(type_label.upper()) + "</span><h2>Arquivos disponíveis</h2></div><span class='count-badge'>" + str(len(documents)) + " arquivos</span></div>" + self.documents_table_workspace(documents, user["role"] == "admin" and selected_store is None) + "</section>"
+        main = ""
         message = self.query_message()
         if message:
-            content = content.replace("<main class='workspace-main'>", f"<main class='workspace-main'><div class='notice'>{h(message)}</div>", 1)
-        content += "</main></div>"
-        self.send_page(HTTPStatus.OK, type_label, content, user)
+            main += f"<div class='notice' role='status'>{h(message)}</div>"
+        if selected_store:
+            main += self.page_heading(f"{label} · {subject}", selected_store["name"], f"CNPJ {format_cnpj(selected_store['cnpj'])}")
+        else:
+            main += self.page_heading(f"{label} · {subject}", "Central fiscal", "Publique arquivos, cadastre lojas e acompanhe a rede.")
+        if admin:
+            main += self.admin_tools(user, stores, selected_store, document_type, competence)
+        if selected_store and matrix_with_file:
+            main += (f"<div class='empty-state'><span class='empty-mark'>{icon('file')}</span><strong>O {h(label)} desta loja é entregue pela matriz</strong>"
+                     "<span>O arquivo da matriz reúne todas as lojas do grupo, inclusive esta.</span>"
+                     f"<a class='btn btn-primary btn-sm' href='{dashboard_link(matrix_with_file['id'], document_type)}'><span>Abrir arquivo da matriz</span>{icon('arrow')}</a></div>")
+        elif selected_store:
+            main += self.period_nav(selected_store, document_type, months, competences, competence, units)
+            if competence in competences:
+                main += self.files_card(documents, competence)
+                main += self.summary_section(documents, competence)
+            else:
+                main += self.forecast_card(document_type, competence, units)
+        else:
+            main += self.stores_table(store_rows, document_type) + self.recent_uploads(documents)
 
-    def documents_table_workspace(self, documents: list[sqlite3.Row], show_store: bool) -> str:
+        content = "<div class='workspace'>" + self.sidebar(user, stores, selected_store, document_type) + "<main class='workspace-main'>" + main + "</main></div>"
+        self.send_page(HTTPStatus.OK, selected_store["name"] if selected_store else "Central fiscal", content, user)
+
+    def page_heading(self, kicker: str, title: str, text: str) -> str:
+        return f"<div class='page-heading'><div><span class='section-kicker'>{h(kicker.upper())}</span><h1>{h(title)}</h1><p>{h(text)}</p></div></div>"
+
+    def sidebar(self, user: sqlite3.Row, stores: list[sqlite3.Row], selected_store: sqlite3.Row | None, document_type: str) -> str:
+        """Barra lateral: loja aberta, troca de loja (lista para o grupo, seletor para a administração) e tipo de SPED."""
+        admin = user["role"] == "admin"
+        if selected_store:
+            identity = f"<strong>{h(selected_store['name'])}</strong><small>CNPJ {h(format_cnpj(selected_store['cnpj']))}</small>"
+        else:
+            identity = "<strong>Todas as lojas</strong><small>Visão da administração</small>"
+        picker = ""
+        if admin:
+            options = "<option value=''>Todas as lojas</option>" + "".join(
+                f"<option value='{store['id']}'{' selected' if selected_store and store['id'] == selected_store['id'] else ''}>{h(store['name'])}</option>" for store in stores)
+            picker = ("<form class='store-picker' method='get' action='/dashboard'><input type='hidden' name='type' value='" + h(document_type) + "'>"
+                      "<label for='store_id'>Escolher loja</label><select id='store_id' name='store_id'>" + options + "</select>"
+                      f"<button class='btn btn-outline btn-sm btn-block' type='submit'><span>Abrir loja</span>{icon('arrow')}</button></form>")
+        card = (f"<div class='side-store{' with-picker' if picker else ''}'><div class='side-store-heading'><span class='side-store-mark'>{icon('store')}</span><span>{'LOJA ABERTA' if selected_store else 'REDE'}</span></div>"
+                f"<div class='side-store-identity'>{identity}</div>{picker}</div>")
+        branches = ""
+        if not admin and len(stores) > 1:
+            short = short_store_names(stores)
+            links = ""
+            for store in stores:
+                active = bool(selected_store) and store["id"] == selected_store["id"]
+                cnpj = normalize_cnpj(store["cnpj"] or "")
+                tag = "Matriz" if cnpj[8:12] == "0001" else f"/{cnpj[8:12]}-{cnpj[12:]}"
+                state = " active' aria-current='page" if active else ""
+                links += (f"<a class='branch-link{state}' href='{dashboard_link(store['id'], document_type)}' title='{h(store['name'])}'>"
+                          f"<span>{h(short[store['id']])}</span><small>{h(tag)}</small></a>")
+            branches = f"<nav class='branch-nav' aria-label='Lojas do grupo'><span class='side-section-label'>LOJAS DO GRUPO</span><div class='branch-list'>{links}</div></nav>"
+        store_id = selected_store["id"] if selected_store else None
+        current = " active' aria-current='page"
+        tabs = "".join(
+            f"<a class='sped-tab{current if key == document_type else ''}' href='{dashboard_link(store_id, key)}'>"
+            f"<span class='tab-mark'>{mark}</span><span class='tab-text'>{label}<small>{subject}</small></span></a>"
+            for key, (label, subject, mark) in DOCUMENT_TYPES.items())
+        navigation = f"<nav class='sped-navigation' aria-label='Tipo de arquivo'><span class='side-section-label'>ARQUIVOS</span>{tabs}</nav>"
+        return f"<aside class='workspace-sidebar'><div class='side-overline'>PORTAL DA REDE</div>{card}{branches}{navigation}<div class='side-bottom'><span class='secure-dot'></span> Acesso protegido</div></aside>"
+
+    def period_nav(self, store: sqlite3.Row, document_type: str, months: list[str], published: list[str], competence: str, units: int) -> str:
+        """Meses em ordem cronológica. Os ainda não publicados aparecem como "previsto", com o prazo no tooltip."""
+        current = " active' aria-current='page"
+        pills = ""
+        for comp in months:
+            pending = comp not in published
+            hint = f" title='Previsto até {publication_deadline(comp, units)[0]:%d/%m/%Y}'" if pending else ""
+            pills += (f"<a class='pill{' pending' if pending else ''}{current if comp == competence else ''}' href='{dashboard_link(store['id'], document_type, comp)}'{hint}>"
+                      f"{h(resumo_sped.month_label(comp, short=True).capitalize())}</a>")
+        note = ""
+        upcoming = [comp for comp in months if comp not in published and (not published or comp > max(published))]
+        if upcoming and competence in published:
+            deadline, nth = publication_deadline(upcoming[0], units)
+            note = (f"<p class='period-next'>{icon('calendar')}<span>Próximo arquivo: <strong>{h(resumo_sped.month_label(upcoming[0]).capitalize())}</strong>, "
+                    f"previsto até <strong>{deadline:%d/%m/%Y}</strong> ({nth}º dia útil)</span>{help_tip(LARGE_GROUP_NOTE) if units > SMALL_GROUP_UNITS else ''}</p>")
+        return (f"<nav class='period-nav' aria-label='Mês de referência'><span class='period-label'>Mês de referência</span><div class='pill-list'>{pills}</div></nav>{note}")
+
+    def forecast_card(self, document_type: str, competence: str, units: int) -> str:
+        """Mês ainda sem arquivo: mostra até quando ele deve ser publicado e a regra do prazo."""
+        label = DOCUMENT_TYPES[document_type][0]
+        deadline, nth = publication_deadline(competence, units)
+        month = resumo_sped.month_label(competence)
+        following = resumo_sped.MONTHS[deadline.month - 1]
+        if date.today() > deadline:
+            kicker, text = "EM PREPARAÇÃO", f"O prazo previsto era {deadline:%d/%m/%Y}. O arquivo está em preparação e aparece aqui assim que for publicado."
+        else:
+            kicker, text = "PREVISÃO DE PUBLICAÇÃO", f"O {label} de {month} é publicado depois do fechamento do mês, até o {nth}º dia útil de {following}."
+        if units > SMALL_GROUP_UNITS:
+            rule = f"<p class='forecast-rule'><span>Grupo com {units} lojas: prazo de {LARGE_GROUP_BUSINESS_DAY}º dia útil do mês seguinte.</span>{help_tip(LARGE_GROUP_NOTE)}</p>"
+        else:
+            rule = f"<p class='forecast-rule'><span>Grupos com até {SMALL_GROUP_UNITS} lojas: prazo de {SMALL_GROUP_BUSINESS_DAY}º dia útil do mês seguinte.</span></p>"
+        return (f"<section class='section-block'><div class='forecast-card'><span class='forecast-icon'>{icon('calendar')}</span><div class='forecast-body'>"
+                f"<span class='section-kicker'>{kicker}</span><h2>Até {deadline:%d/%m/%Y}</h2><p>{h(text)}</p>{rule}</div></div></section>")
+
+    def files_card(self, documents: list[sqlite3.Row], competence: str) -> str:
+        files = [doc for doc in documents if doc["competence"] == competence]
+        rows = "".join(
+            f"<li class='file-row'><span class='file-icon'>{icon('file')}</span><div class='file-info'><strong title='{h(doc['original_name'])}'>{h(doc['original_name'])}</strong>"
+            f"<small>Publicado em {h(datetime.fromisoformat(doc['uploaded_at']).strftime('%d/%m/%Y'))} · {h(file_size(doc['size']))}</small></div>"
+            f"<a class='btn btn-primary btn-sm' href='/download/{h(doc['id'])}' aria-label='Baixar {h(doc['original_name'])}'>{icon('download')}<span>Baixar</span></a></li>"
+            for doc in files)
+        total = f"{len(files)} {'arquivo' if len(files) == 1 else 'arquivos'}"
+        return f"<section class='section-block'><div class='section-heading'><div><span class='section-kicker'>ARQUIVOS DO MÊS</span><h2>Pronto para baixar</h2></div><span class='count-badge'>{total}</span></div><ul class='file-list'>{rows}</ul></section>"
+
+    def summary_section(self, documents: list[sqlite3.Row], competence: str) -> str:
+        competences = sorted({doc["competence"] for doc in documents})
+        summaries = {comp: competence_summary(documents, comp) for comp in sorted(set(competences[-12:]) | {competence})}
+        history = [(comp, resumo_sped.headline(summary)) for comp, summary in summaries.items() if summary and summary.get("operacoes")]
+        return ("<section class='section-block summary-block'><div class='section-heading'><div><span class='section-kicker'>RESUMO DO MÊS</span>"
+                f"<h2>{h(resumo_sped.month_label(competence).capitalize())}</h2><p class='section-copy'>Números calculados automaticamente a partir do arquivo deste mês.</p></div></div>"
+                + resumo_sped.render(summaries.get(competence), competence, history) + "</section>")
+
+    def admin_tools(self, user: sqlite3.Row, stores: list[sqlite3.Row], selected_store: sqlite3.Row | None, document_type: str, competence: str) -> str:
+        """Formulários da administração: publicar SPED e cadastrar loja. Recolhidos quando uma loja está aberta."""
+        label = DOCUMENT_TYPES[document_type][0]
+        csrf = h(user["csrf_token"])
+        options = "".join(f"<option value='{store['id']}'{' selected' if selected_store and store['id'] == selected_store['id'] else ''}>{h(store['name'])} · {h(format_cnpj(store['cnpj']))}</option>" for store in stores)
+        month_value = f" value='{h(competence)}'" if competence else ""
+        upload = (f"<div class='panel'><div class='panel-title'><span class='panel-icon upload-icon'>{icon('upload')}</span><div><span class='section-kicker'>PUBLICAR · {h(label.upper())}</span><h2>Enviar arquivo SPED</h2></div></div>"
+                  "<p class='panel-copy'>O portal confere o CNPJ e o mês no próprio arquivo antes de publicar.</p>"
+                  f"<form method='post' enctype='multipart/form-data' action='/upload' class='stack-form'><input type='hidden' name='csrf' value='{csrf}'><input type='hidden' name='document_type' value='{h(document_type)}'>"
+                  f"<label>Loja<select name='store_id' required><option value=''>Selecione a loja</option>{options}</select></label>"
+                  f"<label>Mês de referência<input name='competence' type='month'{month_value} required></label>"
+                  "<label>Arquivo .txt<input class='file-input' name='file' type='file' accept='.txt,text/plain' required><small class='field-help'>Até 40 MB. O CNPJ e o mês precisam ser os da loja escolhida.</small></label>"
+                  f"<button class='btn btn-primary' type='submit'>{icon('upload')}<span>Validar e publicar</span></button></form></div>")
+        register = (f"<div class='panel'><div class='panel-title'><span class='panel-icon store-icon'>{icon('plus')}</span><div><span class='section-kicker'>ACESSOS</span><h2>Cadastrar loja</h2></div></div>"
+                    "<p class='panel-copy'>Crie o acesso da farmácia. Ela entra com o CNPJ e esta senha.</p>"
+                    f"<form method='post' action='/stores' class='stack-form'><input type='hidden' name='csrf' value='{csrf}'>"
+                    "<label>Nome da loja<input name='name' maxlength='120' placeholder='Ex.: Farmácia Central' required></label>"
+                    "<label>CNPJ<input name='cnpj' inputmode='numeric' maxlength='18' placeholder='00.000.000/0000-00' required></label>"
+                    "<label>Senha inicial<input name='password' type='password' minlength='12' autocomplete='new-password' placeholder='Mínimo de 12 caracteres' required></label>"
+                    f"<button class='btn btn-outline' type='submit'>{icon('plus')}<span>Criar acesso</span></button></form></div>")
+        grid = f"<div class='admin-grid'>{upload}{register}</div>"
+        if selected_store:
+            return f"<details class='more-details admin-tools'><summary><span class='more-title'>Publicar arquivo ou cadastrar loja</span><span class='more-hint'>Ferramentas da administração</span></summary>{grid}</details>"
+        return f"<section class='admin-section'>{grid}</section>"
+
+    def stores_table(self, store_rows: list[sqlite3.Row], document_type: str) -> str:
+        rows = "".join(
+            f"<tr><td class='store-name'>{h(store['name'])}</td><td class='mono'>{h(format_cnpj(store['cnpj']))}</td><td>{store['total']}</td>"
+            f"<td class='cell-action'><a class='btn btn-outline btn-sm' href='{dashboard_link(store['id'], document_type)}'><span>Abrir</span>{icon('arrow')}</a></td></tr>"
+            for store in store_rows) or "<tr><td colspan='4' class='empty-cell'>Nenhuma loja cadastrada ainda.</td></tr>"
+        return (f"<section class='section-block'><div class='section-heading'><div><span class='section-kicker'>REDE</span><h2>Lojas cadastradas</h2></div><span class='count-badge'>{len(store_rows)} lojas</span></div>"
+                f"<div class='table-wrap'><table><thead><tr><th>LOJA</th><th>CNPJ</th><th>ARQUIVOS</th><th></th></tr></thead><tbody>{rows}</tbody></table></div></section>")
+
+    def recent_uploads(self, documents: list[sqlite3.Row]) -> str:
         if not documents:
-            return "<div class='empty-state'><span class='empty-mark'>—</span><strong>Nenhum arquivo deste tipo nesta loja</strong><span>Quando um arquivo for publicado, ele aparecerá aqui por competência.</span></div>"
-        rows = "".join((f"<tr><td class='store-name'>{h(doc['store_name'])}</td>" if show_store else "<tr>") + f"<td><span class='month-tag'>{h(doc['competence'][5:7] + '/' + doc['competence'][:4])}</span></td><td class='file-name'>{h(doc['original_name'])}</td><td class='muted'>{h(datetime.fromisoformat(doc['uploaded_at']).strftime('%d/%m/%Y'))}</td><td><a class='download-link' href='/download/{h(doc['id'])}' title='Baixar arquivo' aria-label='Baixar {h(doc['original_name'])}'>↓</a></td></tr>" for doc in documents)
-        columns = "<th>LOJA</th>" if show_store else ""
-        return f"<div class='table-wrap'><table><thead><tr>{columns}<th>COMPETÊNCIA</th><th>ARQUIVO</th><th>PUBLICADO</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>"
+            return ""
+        rows = "".join(
+            f"<tr><td class='store-name'>{h(doc['store_name'])}</td><td><span class='month-tag'>{h(doc['competence'][5:7] + '/' + doc['competence'][:4])}</span></td>"
+            f"<td class='file-name' title='{h(doc['original_name'])}'>{h(doc['original_name'])}</td><td class='muted'>{h(datetime.fromisoformat(doc['uploaded_at']).strftime('%d/%m/%Y'))}</td>"
+            f"<td class='cell-action'><a class='btn btn-ghost btn-sm' href='/download/{h(doc['id'])}' aria-label='Baixar {h(doc['original_name'])}'>{icon('download')}<span>Baixar</span></a></td></tr>"
+            for doc in documents)
+        return (f"<section class='section-block'><div class='section-heading'><div><span class='section-kicker'>ÚLTIMAS PUBLICAÇÕES</span><h2>Arquivos enviados recentemente</h2></div></div>"
+                f"<div class='table-wrap'><table><thead><tr><th>LOJA</th><th>MÊS</th><th>ARQUIVO</th><th>PUBLICADO</th><th></th></tr></thead><tbody>{rows}</tbody></table></div></section>")
 
     def query_message(self) -> str:
         code = parse_qs(urlparse(self.path).query).get("status", [""])[0]
@@ -477,10 +781,12 @@ class PortalHandler(BaseHTTPRequestHandler):
             self.send_page(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Envio inválido", "<main class='content'><h1>Arquivo acima do limite de 40 MB.</h1></main>")
             return
         user = self.get_user()
-        if not self.check_csrf(data, user):
-            if path == "/login":
-                self.redirect("/login")
-                return
+        if path == "/login" and not self.check_csrf(data, None):
+            # Nunca volta ao login em silêncio: mostra o formulário de novo, com o CNPJ já preenchido.
+            credential = data.get("cnpj", "")
+            self.send_login_page(HTTPStatus.OK, "A página de acesso expirou. Digite a senha e clique em Entrar novamente.", credential if isinstance(credential, str) else "")
+            return
+        if path != "/login" and not self.check_csrf(data, user):
             self.send_page(HTTPStatus.FORBIDDEN, "Sessão expirada", "<main class='content'><h1>Sessão expirada. Atualize a página e tente novamente.</h1></main>", user)
             return
         if path == "/login":
@@ -506,7 +812,7 @@ class PortalHandler(BaseHTTPRequestHandler):
         with connect() as db:
             attempt = db.execute("SELECT attempts, window_start FROM login_attempts WHERE ip=?", (ip,)).fetchone()
             if attempt and attempt["window_start"] > now - 900 and attempt["attempts"] >= 10:
-                self.send_page(HTTPStatus.TOO_MANY_REQUESTS, "Aguarde", "<main class='content'><h1>Muitas tentativas. Aguarde 15 minutos.</h1></main>")
+                self.send_login_page(HTTPStatus.TOO_MANY_REQUESTS, "Muitas tentativas seguidas. Aguarde 15 minutos e tente de novo.")
                 return
             credential, password = data.get("cnpj", ""), data.get("password", "")
             credential = credential.strip() if isinstance(credential, str) else ""
@@ -516,7 +822,7 @@ class PortalHandler(BaseHTTPRequestHandler):
             if not account or not verify_password(password, account["password_hash"]):
                 attempts = attempt["attempts"] + 1 if attempt and attempt["window_start"] > now - 900 else 1
                 db.execute("INSERT INTO login_attempts VALUES (?, ?, ?) ON CONFLICT(ip) DO UPDATE SET attempts=excluded.attempts, window_start=excluded.window_start", (ip, attempts, attempt["window_start"] if attempt and attempt["window_start"] > now - 900 else now))
-                self.send_page(HTTPStatus.UNAUTHORIZED, "Acesso não autorizado", self.login_error())
+                self.send_login_page(HTTPStatus.UNAUTHORIZED, "CNPJ ou senha incorretos. Confira e tente novamente.", credential)
                 return
             db.execute("DELETE FROM login_attempts WHERE ip=?", (ip,))
             raw_token = secrets.token_urlsafe(32)
@@ -529,10 +835,6 @@ class PortalHandler(BaseHTTPRequestHandler):
         self.send_header("Set-Cookie", f"portal_session={raw_token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_SECONDS}" + ("; Secure" if os.environ.get("COOKIE_SECURE") == "1" else ""))
         self.send_header("Set-Cookie", "login_nonce=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
         self.end_headers()
-
-    def login_error(self) -> bytes:
-        content = "<main class='login-layout'><section class='login-brand'><div class='eyebrow'>ÁREA EXCLUSIVA</div><h1>Fiscal em dia.<br><em>Sem complicação.</em></h1><p>Seus arquivos fiscais, organizados por competência e protegidos em um só lugar.</p></section><section class='login-panel'><div class='notice notice-error'>CNPJ ou senha incorretos.</div><div class='login-heading'><span class='section-kicker'>TENTE NOVAMENTE</span><h2>Acesse seu portal</h2></div><a class='button button-outline' href='/login'>Voltar ao acesso</a></section></main>"
-        return render_page("Acesso", content)
 
     def add_store(self, data: dict[str, str | bytes]) -> None:
         name, cnpj, password = data.get("name", ""), data.get("cnpj", ""), data.get("password", "")
@@ -586,9 +888,12 @@ class PortalHandler(BaseHTTPRequestHandler):
                 db.execute("INSERT INTO documents (id, store_id, document_type, competence, original_name, size, sha256, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (doc_id, store["id"], document_type, competence, filename, len(file_content), hashlib.sha256(file_content).hexdigest(), uploaded_at))
             except sqlite3.IntegrityError:
                 document_path.unlink(missing_ok=True)
-                self.redirect("/dashboard?status=exists")
+                self.redirect(f"/dashboard?store_id={store['id']}&type={document_type}&competence={competence}&status=exists")
                 return
-        self.redirect("/dashboard?status=uploaded")
+        with connect() as db:
+            document = db.execute("SELECT * FROM documents WHERE id=?", (doc_id,)).fetchone()
+        document_summary(document)
+        self.redirect(f"/dashboard?store_id={store['id']}&type={document_type}&competence={competence}&status=uploaded")
 
     def redirect(self, location: str) -> None:
         self.send_response(HTTPStatus.SEE_OTHER)
@@ -610,6 +915,23 @@ def main() -> None:
         except (ValueError, sqlite3.IntegrityError) as error:
             raise SystemExit(str(error)) from error
         print("Administrador criado. Inicie o portal com: python app.py")
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "redefinir-senha":
+        cnpj = sys.argv[2] if len(sys.argv) > 2 else input("CNPJ da loja: ")
+        try:
+            name, password = reset_store_password(cnpj)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
+        print(f"Loja: {name}")
+        print(f"CNPJ: {format_cnpj(cnpj)}")
+        print(f"Nova senha: {password}")
+        print("Sessões antigas encerradas e bloqueios de tentativa liberados.")
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "gerar-resumos":
+        with connect() as db:
+            documents = db.execute("SELECT * FROM documents ORDER BY uploaded_at").fetchall()
+        failures = sum(1 for document in documents if document_summary(document) is None)
+        print(f"Resumos prontos: {len(documents) - failures} de {len(documents)} arquivos.")
         return
     host = os.environ.get("PORTAL_HOST", "127.0.0.1")
     port = int(os.environ.get("PORTAL_PORT", "8000"))

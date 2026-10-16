@@ -27,6 +27,24 @@ O servidor escuta apenas em `127.0.0.1` por padrão. Para encerrar, use `Ctrl+C`
 
 Cada instalação deve criar seu próprio administrador e cadastrar suas lojas. Nenhum usuário, senha, arquivo fiscal ou conjunto de dados local é fornecido pelo repositório.
 
+## Servidor provisório no Windows
+
+Enquanto o portal não tem hospedagem definitiva, ele pode rodar neste computador:
+
+| Arquivo | O que faz |
+| --- | --- |
+| `iniciar-portal.bat` | Sobe o portal em http://127.0.0.1:8000. Se o processo cair, reinicia em 10 segundos. Se o portal já estiver no ar, não abre uma segunda cópia. Registro em `logs/portal.log`. |
+| `instalar-servico.bat` | Cria a tarefa do Windows **Portal Fiscal**, que roda o `iniciar-portal.bat` como SYSTEM sempre que o computador liga, mesmo sem ninguém fazer login. Pede permissão de administrador. |
+| `remover-servico.bat` | Remove a tarefa e para o portal. |
+
+Para ver se a tarefa está instalada e o portal no ar:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\servico-windows.ps1 -Acao status
+```
+
+A tarefa não tem limite de tempo de execução e também roda na bateria. Se falhar, o Windows tenta de novo a cada minuto. O servidor escuta só em `127.0.0.1`. Para abrir na rede interna, defina `PORTAL_HOST=0.0.0.0` no `iniciar-portal.bat` e libere a porta no firewall. Faça isso apenas em rede confiável, seguindo as recomendações de implantação abaixo.
+
 ## Publicar um SPED
 
 1. Entre como administrador e cadastre a loja com nome, CNPJ válido e senha inicial.
@@ -41,6 +59,32 @@ O arquivo precisa conter, no início, um registro `0000` SPED EFD com período d
 ### Matriz e filiais
 
 Contas de loja cujos CNPJs compartilham os mesmos 8 primeiros dígitos são tratadas como estabelecimentos da mesma empresa. Após entrar, o usuário pode escolher uma dessas filiais no seletor lateral; a sessão continua aberta, mas a lista e os downloads mostram somente os documentos da filial selecionada. O servidor também aplica esse escopo na rota de download, impedindo acesso a CNPJs de outra raiz. O vínculo é automático pelo CNPJ-base e não exige cadastrar relações separadas.
+
+### Resumo fiscal da competência
+
+Ao abrir uma loja, acima da lista de arquivos, o portal mostra um resumo gerencial da competência escolhida, calculado a partir dos SPEDs publicados:
+
+- **SPED Fiscal:** saídas e entradas (C100/C190), apuração do ICMS (E110), ICMS-ST (E210), vencimento (E116) e inventário (H005). Traz movimento diário, vendas por tributação do ICMS, principais CFOPs e maiores fornecedores.
+- **SPED Contribuições:** receita tributada e sem incidência (M210/M400), PIS e COFINS apurados e a recolher (M200/M600), créditos (M100/M500) e movimento por estabelecimento (C010/C100).
+
+Documentos cancelados são ignorados, e notas com CFOP x.929 ficam fora das vendas para não duplicar cupons e NFC-e. Quando há mais de um arquivo na competência, cada seção vem do arquivo mais recente que a contém. Com duas ou mais competências publicadas, aparece também a evolução mensal.
+
+O resumo é calculado no upload e guardado na tabela `document_summaries`. Para gerar os resumos de arquivos publicados antes desta versão:
+
+```powershell
+python app.py gerar-resumos
+```
+
+Os gráficos são SVG e CSS gerados no servidor, sem JavaScript. O resumo é gerencial e não substitui a apuração oficial.
+
+### Previsão de publicação
+
+O painel mostra os meses até dezembro/2026 (ajustável por `PORTAL_PREVISAO_ATE`, no formato `AAAA-MM`). Os meses sem arquivo aparecem como previstos, com o prazo de publicação:
+
+- grupos com até 3 lojas (mesma raiz de CNPJ): até o **3º dia útil** do mês seguinte à competência;
+- grupos com mais de 3 lojas: até o **5º dia útil**, com um ícone "?" explicando que o volume exige mais tempo e que correções entram na fila depois das postagens regulares.
+
+A regra vale para o SPED Fiscal e o SPED Contribuições. Os dias úteis descontam fins de semana, feriados nacionais, Carnaval e Sexta-feira Santa. Feriados estaduais e municipais não são considerados.
 
 ## Dados locais
 

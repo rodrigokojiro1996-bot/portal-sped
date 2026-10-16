@@ -9,3 +9,4 @@ sped-import-report.csv
 /SPEDs/
 .venv/
 .env*
+/logs/
