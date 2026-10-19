@@ -77,10 +77,13 @@ A tarefa não tem limite de tempo de execução e também roda na bateria. Se fa
 ## Publicar um SPED
 
 1. Entre como administrador e cadastre a loja com nome, CNPJ válido e senha inicial.
-2. Abra a loja pela lista ou selecione-a na lateral e escolha `SPED Fiscal` ou `SPED Contribuições`.
-3. Escolha a competência e envie o arquivo `.txt` na área do tipo correspondente.
-4. O portal lê o registro `0000` no leiaute do tipo escolhido, valida os dígitos verificadores do CNPJ e confirma que o CNPJ e o mês do arquivo correspondem à loja e à competência selecionadas.
-5. Só então o arquivo é armazenado. Arquivos idênticos são bloqueados por hash; arquivos complementares diferentes podem coexistir na mesma loja, tipo e competência. Fiscal e Contribuições também podem coexistir.
+2. No painel, em **Enviar arquivo SPED**, escolha o arquivo `.txt` e clique em **Validar e publicar**. Não é preciso escolher loja, tipo nem mês.
+3. O portal lê o registro `0000` e identifica sozinho:
+   - o **tipo**: SPED Fiscal (ICMS/IPI) ou SPED Contribuições (PIS/COFINS), pela posição do período e do CNPJ, que é diferente em cada leiaute;
+   - a **loja**, pelo CNPJ do arquivo (com os dígitos verificadores conferidos), entre as lojas ativas;
+   - a **competência**, pelo período, que precisa cobrir um mês-calendário completo.
+4. O arquivo é anexado na aba do tipo certo da loja, e um pop-up confirma o tipo, a loja, o CNPJ e a competência. Se algo não bater (CNPJ sem loja cadastrada, período parcial, arquivo que não é SPED EFD), o pop-up explica o motivo e nada é gravado.
+5. Arquivos idênticos são bloqueados por hash; arquivos complementares diferentes podem coexistir na mesma loja, tipo e competência. Fiscal e Contribuições também podem coexistir.
 6. A loja acessa a conta com seu CNPJ, escolhe o módulo e baixa os arquivos autorizados.
 
 O arquivo precisa conter, no início, um registro `0000` SPED EFD com período de mês-calendário completo. O parser usa os campos próprios de cada leiaute: EFD Fiscal e EFD Contribuições. Arquivos acima de 40 MB, períodos incompatíveis, CNPJ divergente e arquivos sem esse registro são recusados. A plataforma não substitui a validação do PVA/SPED nem confere todas as regras fiscais do arquivo.
@@ -166,4 +169,4 @@ O proxy deve forçar HTTPS, não deve ser acessível por HTTP público e precisa
 python -m unittest discover -s tests -v
 ```
 
-A suíte cobre dígitos verificadores do CNPJ, extração do cabeçalho/competência, recusas de período inválido, política de senha e criação de conta.
+A suíte cobre dígitos verificadores do CNPJ, extração do cabeçalho/competência, identificação do tipo de SPED, publicação automática na loja e aba certas (com o pop-up de confirmação e as recusas), recusas de período inválido, política de senha e criação de conta.

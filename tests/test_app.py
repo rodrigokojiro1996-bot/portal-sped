@@ -512,5 +512,188 @@ class DashboardSummaryTests(unittest.TestCase):
                 restore_storage()
 
 
+STORE_A_CNPJ, STORE_B_CNPJ, UNREGISTERED_CNPJ = "11222333000181", "11444777000161", "45543915000181"
+
+
+def sped(sample, cnpj=STORE_A_CNPJ, period="01092026|30092026"):
+    """Amostra SPED com outro CNPJ e período no registro 0000 (as demais linhas ficam como estão)."""
+    first, rest = sample.split("\r\n", 1)
+    fields = first.split("|")
+    start, end = period.split("|")
+    if fields[2] == "006":  # Contribuições
+        fields[6], fields[7], fields[9] = start, end, cnpj
+    else:
+        fields[4], fields[5], fields[7] = start, end, cnpj
+    return ("|".join(fields) + "\r\n" + rest).encode()
+
+
+class SpedTypeDetectionTests(unittest.TestCase):
+    """O portal precisa saber, só pelo arquivo, se ele é SPED Fiscal (ICMS/IPI) ou SPED Contribuições (PIS/COFINS)."""
+
+    def test_detects_fiscal_icms_ipi(self):
+        self.assertEqual(app.detect_sped_type(FISCAL_SAMPLE.encode()), "fiscal")
+
+    def test_detects_contributions_pis_cofins(self):
+        self.assertEqual(app.detect_sped_type(CONTRIBUTIONS_SAMPLE.encode()), "contribuicoes")
+
+    def test_detects_file_saved_with_utf8_bom(self):
+        self.assertEqual(app.detect_sped_type(b"\xef\xbb\xbf" + CONTRIBUTIONS_SAMPLE.encode()), "contribuicoes")
+
+    def test_rejects_other_sped_layouts_and_plain_text(self):
+        ecd = b"|0000|LECD|01012026|31122026|FARMACIA EXEMPLO LTDA|11222333000181|RS||4314902|||0|0|0||0|0||N|N|0|0|\r\n"
+        for content in (ecd, b"relatorio de vendas\r\nsem registro 0000\r\n", b""):
+            with self.subTest(content=content[:20]):
+                with self.assertRaisesRegex(ValueError, "não foi reconhecido"):
+                    app.detect_sped_type(content)
+
+
+class AutoPublishTests(unittest.TestCase):
+    """Publicação automática: o portal acha a loja pelo CNPJ, a competência pelo período e a aba pelo tipo do arquivo."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        app.configure_storage(Path(self.temporary.name))
+        app.create_user(STORE_A_CNPJ, "Farmácia Centro", "store", "senha-centro-123")
+        app.create_user(STORE_B_CNPJ, "Farmácia Bairro", "store", "senha-bairro-123")
+        app.create_user(None, "Admin Exemplo", "admin", "senha-admin-123", "admin.teste")
+        with app.connect() as db:
+            ids = {row["name"]: row["id"] for row in db.execute("SELECT id, name FROM users")}
+            db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (app.token_hash("admin-session"), ids["Admin Exemplo"], "csrf-admin", int(time.time()) + 3600))
+        self.store_a, self.store_b = ids["Farmácia Centro"], ids["Farmácia Bairro"]
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), app.PortalHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        restore_storage()
+        self.temporary.cleanup()
+
+    def documents(self):
+        with app.connect() as db:
+            return [dict(row) for row in db.execute("SELECT store_id, document_type, competence, original_name FROM documents ORDER BY uploaded_at")]
+
+    def stored_files(self):
+        return sorted(path.name for path in app.DOCUMENTS.iterdir())
+
+    def post_file(self, content, file_name="sped.txt", csrf="csrf-admin"):
+        """Envia o formulário de publicação como o navegador: só o csrf e o arquivo."""
+        boundary = "----portal" + uuid.uuid4().hex
+        body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"csrf\"\r\n\r\n{csrf}\r\n"
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\nContent-Type: text/plain\r\n\r\n").encode() + content + f"\r\n--{boundary}--\r\n".encode()
+        request = Request(self.base + "/upload", data=body, headers={"Cookie": "portal_session=admin-session", "Content-Type": f"multipart/form-data; boundary={boundary}"})
+        try:
+            with urlopen(request) as response:  # segue o redirecionamento até o painel da loja
+                return response.status, response.geturl(), response.read().decode()
+        except HTTPError as error:
+            with error:
+                return error.code, error.geturl(), error.read().decode()
+
+    # ---------------------------------------------------------------- regra de publicação
+
+    def test_fiscal_file_is_attached_to_store_of_its_cnpj_in_fiscal_tab(self):
+        content = sped(FISCAL_SAMPLE, STORE_A_CNPJ)
+        published = app.publish_sped(content, "sped-fiscal-centro.txt")
+        self.assertEqual((published["store_id"], published["document_type"], published["competence"]), (self.store_a, "fiscal", "2026-09"))
+        self.assertEqual(self.documents(), [{"store_id": self.store_a, "document_type": "fiscal", "competence": "2026-09", "original_name": "sped-fiscal-centro.txt"}])
+        self.assertEqual((app.DOCUMENTS / f"{published['id']}.txt").read_bytes(), content)
+
+    def test_contributions_file_is_attached_to_store_of_its_cnpj_in_contributions_tab(self):
+        published = app.publish_sped(sped(CONTRIBUTIONS_SAMPLE, STORE_B_CNPJ), "contribuicoes.txt")
+        self.assertEqual((published["store_id"], published["document_type"], published["competence"]), (self.store_b, "contribuicoes", "2026-09"))
+        self.assertEqual(published["store_name"], "Farmácia Bairro")
+
+    def test_competence_comes_from_the_period_inside_the_file(self):
+        published = app.publish_sped(sped(FISCAL_SAMPLE, STORE_B_CNPJ, "01022026|28022026"), "fevereiro.txt")
+        self.assertEqual(published["competence"], "2026-02")
+
+    def test_fiscal_and_contributions_of_same_store_and_month_coexist(self):
+        app.publish_sped(sped(FISCAL_SAMPLE), "fiscal.txt")
+        app.publish_sped(sped(CONTRIBUTIONS_SAMPLE), "contribuicoes.txt")
+        self.assertEqual([(doc["store_id"], doc["document_type"]) for doc in self.documents()], [(self.store_a, "fiscal"), (self.store_a, "contribuicoes")])
+
+    def test_file_of_unregistered_cnpj_is_refused_and_nothing_is_saved(self):
+        with self.assertRaises(app.PublishError) as error:
+            app.publish_sped(sped(FISCAL_SAMPLE, UNREGISTERED_CNPJ), "outra.txt")
+        self.assertIn("45.543.915/0001-81", str(error.exception))
+        self.assertIn("FARMACIA EXEMPLO LTDA", str(error.exception))
+        self.assertIn("SPED Fiscal (ICMS e IPI)", str(error.exception))
+        self.assertEqual((self.documents(), self.stored_files()), ([], []))
+
+    def test_file_of_inactive_store_is_refused(self):
+        with app.connect() as db:
+            db.execute("UPDATE users SET active=0 WHERE id=?", (self.store_a,))
+        with self.assertRaisesRegex(app.PublishError, "nenhuma loja ativa"):
+            app.publish_sped(sped(FISCAL_SAMPLE), "sped.txt")
+
+    def test_same_file_twice_is_refused_without_duplicating(self):
+        app.publish_sped(sped(FISCAL_SAMPLE), "sped.txt")
+        with self.assertRaisesRegex(app.PublishError, "já está publicado no SPED Fiscal .* Farmácia Centro"):
+            app.publish_sped(sped(FISCAL_SAMPLE), "copia.txt")
+        self.assertEqual((len(self.documents()), len(self.stored_files())), (1, 1))
+
+    def test_invalid_files_are_refused_with_the_reason(self):
+        cases = {
+            "período parcial": (sped(FISCAL_SAMPLE, period="02092026|30092026"), "mês-calendário completo"),
+            "CNPJ inválido": (sped(FISCAL_SAMPLE, "11222333000182"), "CNPJ inválido"),
+            "não é SPED": (b"qualquer texto\r\n", "não foi reconhecido"),
+            "vazio": (b"", "Escolha um arquivo"),
+        }
+        for case, (content, reason) in cases.items():
+            with self.subTest(case=case):
+                with self.assertRaisesRegex(app.PublishError, reason):
+                    app.publish_sped(content, "sped.txt")
+        self.assertEqual(self.stored_files(), [])
+
+    # ---------------------------------------------------------------- tela e pop-up
+
+    def test_upload_form_has_only_the_file_and_the_publish_button(self):
+        with urlopen(Request(self.base + "/dashboard", headers={"Cookie": "portal_session=admin-session"})) as response:
+            page = response.read().decode()
+        form = page.split("action='/upload'", 1)[1].split("</form>", 1)[0]
+        self.assertIn("name='file'", form)
+        self.assertIn("Validar e publicar", form)
+        for removed in ("store_id", "competence", "document_type", "<select"):
+            self.assertNotIn(removed, form)
+
+    def test_publishing_fiscal_shows_popup_with_type_store_cnpj_and_competence(self):
+        status, url, page = self.post_file(sped(FISCAL_SAMPLE), "sped-setembro.txt")
+        self.assertEqual(status, 200)
+        self.assertIn(f"store_id={self.store_a}&type=fiscal&competence=2026-09&published=", url)
+        self.assertIn("<dialog open class='publish-dialog is-success'", page)
+        self.assertIn("O arquivo SPED Fiscal (ICMS e IPI) foi publicado com sucesso na loja Farmácia Centro, CNPJ 11.222.333/0001-81, competência Setembro/2026.", page)
+        self.assertIn("sped-setembro.txt", page)
+        self.assertIn(f"class='sped-tab active' aria-current='page' href='/dashboard?store_id={self.store_a}&amp;type=fiscal'", page)
+
+    def test_publishing_contributions_shows_popup_mentioning_contributions(self):
+        status, url, page = self.post_file(sped(CONTRIBUTIONS_SAMPLE, STORE_B_CNPJ), "contrib.txt")
+        self.assertEqual(status, 200)
+        self.assertIn(f"store_id={self.store_b}&type=contribuicoes&competence=2026-09", url)
+        self.assertIn("O arquivo SPED Contribuições (PIS e COFINS) foi publicado com sucesso na loja Farmácia Bairro, CNPJ 11.444.777/0001-61, competência Setembro/2026.", page)
+        self.assertIn(f"class='sped-tab active' aria-current='page' href='/dashboard?store_id={self.store_b}&amp;type=contribuicoes'", page)
+
+    def test_refused_file_shows_error_popup_and_saves_nothing(self):
+        status, _, page = self.post_file(sped(FISCAL_SAMPLE, UNREGISTERED_CNPJ))
+        self.assertEqual(status, 422)
+        self.assertIn("<dialog open class='publish-dialog is-error'", page)
+        self.assertIn("Arquivo não publicado", page)
+        self.assertIn("45.543.915/0001-81", page)
+        self.assertEqual(self.stored_files(), [])
+
+    def test_publish_requires_valid_form_token(self):
+        status, _, _ = self.post_file(sped(FISCAL_SAMPLE), csrf="token-errado")
+        self.assertEqual(status, 403)
+        self.assertEqual(self.documents(), [])
+
+    def test_popup_only_appears_right_after_publishing(self):
+        _, url, _ = self.post_file(sped(FISCAL_SAMPLE))
+        plain = url.split("&published=")[0].removeprefix(self.base)
+        with urlopen(Request(self.base + plain, headers={"Cookie": "portal_session=admin-session"})) as response:
+            self.assertNotIn("publish-dialog", response.read().decode())
+
+
 if __name__ == "__main__":
     unittest.main()

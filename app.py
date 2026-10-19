@@ -232,12 +232,74 @@ def valid_cnpj(value: str) -> bool:
     return True
 
 
+# Posições de DT_INI, DT_FIN, NOME e CNPJ no registro 0000 de cada leiaute. O Contribuições traz
+# TIPO_ESCRIT, IND_SIT_ESP e NUM_REC_ANTERIOR antes do período, por isso tudo anda duas casas.
+SPED_LAYOUTS = {"fiscal": (4, 5, 6, 7), "contribuicoes": (6, 7, 8, 9)}
+
+
+def detect_sped_type(content: bytes) -> str:
+    """Identifica pelo registro 0000 se o arquivo é SPED Fiscal (ICMS/IPI) ou SPED Contribuições (PIS/COFINS).
+
+    Só um dos leiautes tem datas DDMMAAAA e CNPJ de 14 dígitos nas posições esperadas: no Fiscal, o campo 4
+    é a data inicial; no Contribuições, é o indicador de situação especial (vazio ou um dígito).
+    """
+    text = content.decode("utf-8-sig", errors="replace")
+    for line in text.splitlines()[:500]:
+        fields = line.strip().split("|")
+        if len(fields) > 2 and fields[1] == "0000":
+            matches = [kind for kind, (start, end, _name, cnpj) in SPED_LAYOUTS.items()
+                       if len(fields) > cnpj and re.fullmatch(r"\d{8}", fields[start]) and re.fullmatch(r"\d{8}", fields[end]) and re.fullmatch(r"\d{14}", fields[cnpj])]
+            if len(matches) == 1:
+                return matches[0]
+            break
+    raise ValueError("O arquivo não foi reconhecido como SPED Fiscal (ICMS/IPI) nem como SPED Contribuições (PIS/COFINS).")
+
+
+class PublishError(ValueError):
+    """Arquivo recusado na publicação, com a explicação mostrada à administração."""
+
+
+def publish_sped(content: bytes, file_name: str) -> dict[str, str | int]:
+    """Publicação automática: o tipo, a loja (pelo CNPJ) e a competência vêm do registro 0000 do próprio arquivo."""
+    if not content:
+        raise PublishError("Escolha um arquivo .txt para publicar.")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise PublishError("O arquivo passa do limite de 40 MB.")
+    try:
+        document_type = detect_sped_type(content)
+        header = parse_sped_header(content, document_type)
+    except ValueError as error:
+        raise PublishError(str(error)) from error
+    label = sped_label(document_type)
+    with connect() as db:
+        store = db.execute("SELECT id, cnpj, name FROM users WHERE role='store' AND active=1 AND cnpj=?", (header["cnpj"],)).fetchone()
+        if not store:
+            raise PublishError(f"O arquivo é um {label} do CNPJ {format_cnpj(header['cnpj'])} ({header['company']}), "
+                               "e nenhuma loja ativa tem esse CNPJ. Cadastre a loja e envie o arquivo de novo.")
+        doc_id = str(uuid.uuid4())
+        filename = Path(file_name or "sped.txt").name[:150] or "sped.txt"
+        document_path = DOCUMENTS / (doc_id + ".txt")
+        document_path.write_bytes(content)
+        try:
+            os.chmod(document_path, 0o600)
+        except OSError:
+            pass
+        try:
+            db.execute("INSERT INTO documents (id, store_id, document_type, competence, original_name, size, sha256, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                       (doc_id, store["id"], document_type, header["competence"], filename, len(content), hashlib.sha256(content).hexdigest(), datetime.now(timezone.utc).isoformat()))
+        except sqlite3.IntegrityError as error:
+            document_path.unlink(missing_ok=True)
+            raise PublishError(f"Este arquivo já está publicado no {label} da loja {store['name']} (CNPJ {format_cnpj(store['cnpj'])}). Nada foi alterado.") from error
+    with connect() as db:
+        document = db.execute("SELECT * FROM documents WHERE id=?", (doc_id,)).fetchone()
+    document_summary(document)
+    return {"id": doc_id, "store_id": store["id"], "store_name": store["name"], "cnpj": store["cnpj"], "document_type": document_type, "competence": header["competence"]}
+
+
 def parse_sped_header(content: bytes, document_type: str = "fiscal") -> dict[str, str]:
-    if document_type not in ("fiscal", "contribuicoes"):
+    if document_type not in SPED_LAYOUTS:
         raise ValueError("Tipo de SPED não reconhecido.")
-    date_start_index, date_end_index, name_index, cnpj_index = (
-        (6, 7, 8, 9) if document_type == "contribuicoes" else (4, 5, 6, 7)
-    )
+    date_start_index, date_end_index, name_index, cnpj_index = SPED_LAYOUTS[document_type]
     text = content.decode("utf-8-sig", errors="replace")
     for line in text.splitlines()[:500]:
         fields = line.strip().split("|")
@@ -465,6 +527,22 @@ DOCUMENT_TYPES = {
     "fiscal": ("SPED Fiscal", "ICMS e IPI", "F"),
     "contribuicoes": ("SPED Contribuições", "PIS e COFINS", "C"),
 }
+
+
+def sped_label(document_type: str) -> str:
+    """Nome completo do tipo, como aparece nas mensagens: "SPED Fiscal (ICMS e IPI)"."""
+    label, subject, _ = DOCUMENT_TYPES[document_type]
+    return f"{label} ({subject})"
+
+
+def publish_dialog(success: bool, message: str, details: list[tuple[str, str]] | None = None) -> str:
+    """Pop-up do resultado da publicação. É um <dialog> nativo que fecha pelo próprio botão, sem JavaScript."""
+    title = "Arquivo publicado com sucesso" if success else "Arquivo não publicado"
+    rows = "".join(f"<div><dt>{h(term)}</dt><dd>{h(value)}</dd></div>" for term, value in details or [])
+    facts = f"<dl class='publish-facts'>{rows}</dl>" if rows else ""
+    return (f"<dialog open class='publish-dialog {'is-success' if success else 'is-error'}' role='{'status' if success else 'alert'}' aria-labelledby='publish-title'>"
+            f"<span class='publish-mark'>{icon('upload' if success else 'file')}</span><h2 id='publish-title'>{title}</h2><p>{h(message)}</p>{facts}"
+            "<form method='dialog'><button class='btn btn-primary' type='submit' autofocus><span>OK, entendi</span></button></form></dialog>")
 
 # Ícones de traço (24x24) desenhados em SVG inline: nítidos em qualquer tela e permitidos pela CSP.
 ICONS = {
@@ -740,7 +818,7 @@ class PortalHandler(BaseHTTPRequestHandler):
         else:
             self.send_page(HTTPStatus.NOT_FOUND, "Página não encontrada", "<main class='content'><h1>Página não encontrada</h1></main>", user)
 
-    def dashboard_workspace(self, user: sqlite3.Row) -> None:
+    def dashboard_workspace(self, user: sqlite3.Row, dialog: str = "", status: int = HTTPStatus.OK) -> None:
         """Tela principal: barra lateral (loja e tipo de SPED) e área de trabalho da loja ou da rede."""
         query = parse_qs(urlparse(self.path).query)
         document_type = query.get("type", ["fiscal"])[0]
@@ -797,7 +875,7 @@ class PortalHandler(BaseHTTPRequestHandler):
         else:
             main += self.page_heading(f"{label} · {subject}", "Central fiscal", "Escolha uma loja para consultar ou baixe os arquivos mais recentes.")
         if admin:
-            main += self.admin_tools(user, stores, selected_store, document_type, competence)
+            main += self.admin_tools(user, selected_store)
         if selected_store and matrix_with_file:
             main += (f"<div class='empty-state'><span class='empty-mark'>{icon('file')}</span><strong>O {h(label)} desta loja é entregue pela matriz</strong>"
                      "<span>O arquivo da matriz reúne todas as lojas do grupo, inclusive esta.</span>"
@@ -812,8 +890,24 @@ class PortalHandler(BaseHTTPRequestHandler):
         else:
             main += self.stores_table(store_rows, document_type) + self.recent_uploads(documents)
 
-        content = "<div class='workspace'>" + self.sidebar(user, stores, selected_store, document_type) + "<main class='workspace-main'>" + main + "</main></div>"
-        self.send_page(HTTPStatus.OK, selected_store["name"] if selected_store else "Central fiscal", content, user)
+        if admin and not dialog:
+            dialog = self.published_dialog(query.get("published", [""])[0])
+        content = dialog + "<div class='workspace'>" + self.sidebar(user, stores, selected_store, document_type) + "<main class='workspace-main'>" + main + "</main></div>"
+        self.send_page(status, selected_store["name"] if selected_store else "Central fiscal", content, user)
+
+    def published_dialog(self, document_id: str) -> str:
+        """Confirmação depois da publicação: tipo do SPED, loja, CNPJ e competência lidos do arquivo."""
+        if not document_id:
+            return ""
+        with connect() as db:
+            document = db.execute("SELECT documents.*, users.name AS store_name, users.cnpj AS store_cnpj FROM documents JOIN users ON users.id=documents.store_id WHERE documents.id=?", (document_id,)).fetchone()
+        if not document:
+            return ""
+        label = sped_label(document["document_type"])
+        month = resumo_sped.month_label(document["competence"]).capitalize()
+        message = f"O arquivo {label} foi publicado com sucesso na loja {document['store_name']}, CNPJ {format_cnpj(document['store_cnpj'])}, competência {month}."
+        return publish_dialog(True, message, [("Tipo", label), ("Loja", document["store_name"]), ("CNPJ", format_cnpj(document["store_cnpj"])),
+                                              ("Competência", month), ("Arquivo", document["original_name"])])
 
     def page_heading(self, kicker: str, title: str, text: str) -> str:
         return f"<div class='page-heading'><div><span class='section-kicker'>{h(kicker.upper())}</span><h1>{h(title)}</h1><p>{h(text)}</p></div></div>"
@@ -913,18 +1007,14 @@ class PortalHandler(BaseHTTPRequestHandler):
                 f"<h2>{h(resumo_sped.month_label(competence).capitalize())}</h2><p class='section-copy'>Números calculados automaticamente a partir do arquivo deste mês.</p></div></div>"
                 + resumo_sped.render(summaries.get(competence), competence, history) + "</section>")
 
-    def admin_tools(self, user: sqlite3.Row, stores: list[sqlite3.Row], selected_store: sqlite3.Row | None, document_type: str, competence: str) -> str:
+    def admin_tools(self, user: sqlite3.Row, selected_store: sqlite3.Row | None) -> str:
         """Formulários da administração: publicar SPED e cadastrar loja. Recolhidos quando uma loja está aberta."""
-        label = DOCUMENT_TYPES[document_type][0]
         csrf = h(user["csrf_token"])
-        options = "".join(f"<option value='{store['id']}'{' selected' if selected_store and store['id'] == selected_store['id'] else ''}>{h(store['name'])} · {h(format_cnpj(store['cnpj']))}</option>" for store in stores)
-        month_value = f" value='{h(competence)}'" if competence else ""
-        upload = (f"<div class='panel'><div class='panel-title'><span class='panel-icon upload-icon'>{icon('upload')}</span><div><span class='section-kicker'>PUBLICAR · {h(label.upper())}</span><h2>Enviar arquivo SPED</h2></div></div>"
-                  "<p class='panel-copy'>O portal confere o CNPJ e o mês no próprio arquivo antes de publicar.</p>"
-                  f"<form method='post' enctype='multipart/form-data' action='/upload' class='stack-form'><input type='hidden' name='csrf' value='{csrf}'><input type='hidden' name='document_type' value='{h(document_type)}'>"
-                  f"<label>Loja<select name='store_id' required><option value=''>Selecione a loja</option>{options}</select></label>"
-                  f"<label>Mês de referência<input name='competence' type='month'{month_value} required></label>"
-                  "<label>Arquivo .txt<input class='file-input' name='file' type='file' accept='.txt,text/plain' required><small class='field-help'>Até 40 MB. O CNPJ e o mês precisam ser os da loja escolhida.</small></label>"
+        upload = (f"<div class='panel'><div class='panel-title'><span class='panel-icon upload-icon'>{icon('upload')}</span><div><span class='section-kicker'>PUBLICAR · FISCAL OU CONTRIBUIÇÕES</span><h2>Enviar arquivo SPED</h2></div></div>"
+                  "<p class='panel-copy'>Escolha o arquivo e publique. O portal lê o registro 0000 e identifica sozinho o tipo (Fiscal ICMS/IPI ou Contribuições PIS/COFINS), "
+                  "a loja pelo CNPJ e a competência. Depois anexa o arquivo na aba certa da loja.</p>"
+                  f"<form method='post' enctype='multipart/form-data' action='/upload' class='stack-form'><input type='hidden' name='csrf' value='{csrf}'>"
+                  "<label>Arquivo .txt<input class='file-input' name='file' type='file' accept='.txt,text/plain' required><small class='field-help'>Até 40 MB. A loja precisa estar cadastrada com o CNPJ do arquivo.</small></label>"
                   f"<button class='btn btn-primary' type='submit'>{icon('upload')}<span>Validar e publicar</span></button></form></div>")
         register = (f"<div class='panel'><div class='panel-title'><span class='panel-icon store-icon'>{icon('plus')}</span><div><span class='section-kicker'>ACESSOS</span><h2>Cadastrar loja</h2></div></div>"
                     "<p class='panel-copy'>Crie o acesso da farmácia. Ela entra com o CNPJ e esta senha.</p>"
@@ -1052,7 +1142,7 @@ class PortalHandler(BaseHTTPRequestHandler):
 
     def query_message(self) -> str:
         code = parse_qs(urlparse(self.path).query).get("status", [""])[0]
-        return {"uploaded": "Arquivo validado e publicado para a loja.", "store-created": "Acesso da loja criado com sucesso.", "exists": "Este mesmo arquivo já está cadastrado para a loja e o tipo de SPED.", "invalid": "Não foi possível concluir. Confira os dados e a validação do arquivo."}.get(code, "")
+        return {"store-created": "Acesso da loja criado com sucesso.", "invalid": "Não foi possível concluir. Confira os dados informados."}.get(code, "")
 
     def download(self, user: sqlite3.Row, document_id: str) -> None:
         with connect() as db:
@@ -1183,51 +1273,15 @@ class PortalHandler(BaseHTTPRequestHandler):
         self.redirect("/dashboard?status=store-created")
 
     def upload(self, data: dict[str, str | bytes]) -> None:
-        file_content = data.get("file", b"")
-        store_id, competence = data.get("store_id", ""), data.get("competence", "")
-        document_type = data.get("document_type", "")
-        original_name = data.get("file_name", "")
-        if not isinstance(file_content, bytes) or not file_content or len(file_content) > MAX_UPLOAD_BYTES:
-            self.redirect("/dashboard?status=invalid")
-            return
-        if not isinstance(store_id, str) or not store_id.isdigit() or not isinstance(competence, str) or not re.fullmatch(r"20\d\d-(0[1-9]|1[0-2])", competence):
-            self.redirect("/dashboard?status=invalid")
-            return
-        if document_type not in ("fiscal", "contribuicoes"):
-            self.redirect("/dashboard?status=invalid")
-            return
+        """Publica o SPED na loja do CNPJ do arquivo, na aba do tipo e no mês lidos do registro 0000."""
+        file_content, file_name = data.get("file", b""), data.get("file_name", "")
         try:
-            header = parse_sped_header(file_content, document_type)
-        except ValueError:
-            self.redirect("/dashboard?status=invalid")
+            published = publish_sped(file_content if isinstance(file_content, bytes) else b"", file_name if isinstance(file_name, str) else "")
+        except PublishError as error:
+            self.path = "/dashboard"
+            self.dashboard_workspace(self.get_user(), publish_dialog(False, str(error)), HTTPStatus.UNPROCESSABLE_ENTITY)
             return
-        if header["competence"] != competence:
-            self.redirect("/dashboard?status=invalid")
-            return
-        with connect() as db:
-            store = db.execute("SELECT id, cnpj FROM users WHERE id=? AND role='store' AND active=1", (int(store_id),)).fetchone()
-            if not store or store["cnpj"] != header["cnpj"]:
-                self.redirect("/dashboard?status=invalid")
-                return
-            doc_id = str(uuid.uuid4())
-            filename = Path(original_name if isinstance(original_name, str) and original_name else "sped.txt").name[:150]
-            uploaded_at = datetime.now(timezone.utc).isoformat()
-            document_path = DOCUMENTS / (doc_id + ".txt")
-            document_path.write_bytes(file_content)
-            try:
-                os.chmod(document_path, 0o600)
-            except OSError:
-                pass
-            try:
-                db.execute("INSERT INTO documents (id, store_id, document_type, competence, original_name, size, sha256, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (doc_id, store["id"], document_type, competence, filename, len(file_content), hashlib.sha256(file_content).hexdigest(), uploaded_at))
-            except sqlite3.IntegrityError:
-                document_path.unlink(missing_ok=True)
-                self.redirect(f"/dashboard?store_id={store['id']}&type={document_type}&competence={competence}&status=exists")
-                return
-        with connect() as db:
-            document = db.execute("SELECT * FROM documents WHERE id=?", (doc_id,)).fetchone()
-        document_summary(document)
-        self.redirect(f"/dashboard?store_id={store['id']}&type={document_type}&competence={competence}&status=uploaded")
+        self.redirect(f"/dashboard?store_id={published['store_id']}&type={published['document_type']}&competence={published['competence']}&published={published['id']}")
 
     def redirect(self, location: str) -> None:
         self.send_response(HTTPStatus.SEE_OTHER)
