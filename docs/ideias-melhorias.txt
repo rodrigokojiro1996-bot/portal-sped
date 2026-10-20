@@ -1,0 +1,231 @@
+PORTAL FISCAL (portal-sped) - IDEIAS E SUGESTOES DE MELHORIA
+=============================================================
+Anotacoes de 2026-10-20, a partir da versao 1.5.0 (branch publicacao-automatica-sped,
+commit 2a849ae). Base de comparacao: a estrutura do Nossa Rede (Next.js), adaptando
+os principios ao portal, que e Python puro.
+
+Nada aqui foi implementado ainda. Cada item diz o que fazer, por que e como conferir.
+
+
+-------------------------------------------------------------
+0. RETRATO DE HOJE
+-------------------------------------------------------------
+- app.py ............ 1380 linhas: configuracao, banco, autenticacao/CSRF, leitura do
+                      SPED, calendario de prazos, auditoria, HTML e a classe
+                      PortalHandler (rotas, ~630 linhas, da linha 684 a 1311).
+- resumo_sped.py .... 660 linhas (resumo fiscal da competencia).
+- tests/test_app.py . 780 linhas, 54 testes, tudo num arquivo.
+- Banco ............. sem migracoes numeradas: initialize_database() e
+                      migrate_user_roles() ajustam o esquema na abertura.
+- Operacao .......... .bat na raiz; sem rota de saude; backups .bak feitos a mao
+                      dentro de data/.
+- Versoes ........... CHANGELOG e docs/versao-1.5.md existem, mas a unica tag do git
+                      e v1.1.0; a 1.5.0 esta numa branch, sem tag.
+
+O QUE JA ESTA BOM E DEVE SER MANTIDO
+- Zero dependencias externas (so biblioteca padrao do Python 3.11+).
+- CHANGELOG.md e um documento tecnico por versao (docs/versao-X.md).
+- data/, logs/, *.sqlite3 e credenciais fora do git (.gitignore correto).
+- Escuta so em 127.0.0.1 por padrao; sem senha padrao nem conta de demonstracao.
+- SPED_LAYOUTS como tabela unica para deteccao e leitura do cabecalho.
+
+
+-------------------------------------------------------------
+1. QUEBRAR O app.py EM MODULOS          (prioridade 1)
+-------------------------------------------------------------
+Por que: um arquivo de 1380 linhas mistura regra de negocio com HTML e rotas.
+Qualquer mudanca pequena exige entender o arquivo inteiro, e os testes nao
+conseguem testar uma parte sem importar tudo.
+
+Estrutura proposta (o app.py continua existindo, entao "python app.py" e os .bat
+nao mudam):
+
+  portal-sped/
+  |- app.py                 -> so chama portal.main()
+  |- portal/
+  |  |- __init__.py
+  |  |- config.py           -> PORTAL_HOST, PORTAL_PORT, PORTAL_MONITORAMENTO,
+  |  |                         caminhos de data/, PORTAL_VERSION, checagem no boot
+  |  |- db.py               -> configure_storage, connect, aplicacao de migracoes
+  |  |- auth.py             -> password_digest, verify_password, create_user,
+  |  |                         reset_store_password, create_support_user,
+  |  |                         readable_password, ensure_secret, token_hash
+  |  |- sped.py             -> SPED_LAYOUTS, detect_sped_type, parse_sped_header,
+  |  |                         PublishError, publish_sped, normalize_cnpj,
+  |  |                         valid_cnpj (e, depois, o conteudo de resumo_sped.py)
+  |  |- calendario.py       -> easter, non_business_days, business_day,
+  |  |                         next_competence, publication_deadline,
+  |  |                         competence_timeline
+  |  |- auditoria.py        -> audit_entries, audit_sentence, csv_cell,
+  |  |                         machine_name, browser_label
+  |  |- views/
+  |  |  |- layout.py        -> render_page, h, icon, help_tip, file_size
+  |  |  |- painel.py        -> sidebar, period_nav, forecast_card, files_card,
+  |  |  |                      summary_section, stores_table, recent_uploads
+  |  |  |- dialogos.py      -> publish_dialog, sped_label
+  |  |  |- monitoramento.py
+  |  |- handler.py          -> PortalHandler: so roteamento, chamando os modulos
+  |- migrations/            -> ver item 2
+  |- scripts/windows/       -> ver item 7
+  |- static/  tests/  docs/
+
+Ordem segura (um commit por passo, rodando os testes a cada um):
+  a) calendario.py  - funcoes puras, nao dependem de nada
+  b) sped.py        - quase puras
+  c) auth.py
+  d) auditoria.py
+  e) config.py + db.py
+  f) views/
+  g) handler.py por ultimo
+
+Como conferir: "python -m unittest discover -s tests -v" verde depois de cada
+passo, e o portal subindo e publicando um SPED de teste no fim.
+Cuidado: os testes importam "app" e "resumo_sped" diretamente; durante a
+transicao, o app.py pode reexportar os nomes antigos (from portal.sped import *)
+para os testes nao quebrarem de uma vez.
+
+
+-------------------------------------------------------------
+2. MIGRACOES NUMERADAS DO BANCO          (prioridade 2)
+-------------------------------------------------------------
+Por que: hoje o esquema e "consertado" na abertura. Isso funciona com um banco,
+numa maquina, mas fica perigoso quando o portal mudar de servidor ou quando duas
+versoes conviverem. O Nossa Rede usa migracoes com nome e numero
+(ex.: 12_eventos, 15_indices_escala).
+
+Como:
+- Criar tabela schema_version (versao INTEGER, aplicada_em TEXT).
+- Pasta migrations/ com arquivos 001_inicial.sql, 002_perfis_usuario.sql, ...
+- db.py le a versao atual e aplica, em ordem, so os arquivos com numero maior,
+  cada um numa transacao.
+- 001_inicial.sql = o esquema de hoje (tirar de initialize_database).
+- 002 = o que migrate_user_roles faz hoje.
+- Para bancos que ja existem: se a tabela schema_version nao existir mas as
+  tabelas sim, marcar como versao 2 sem rodar nada.
+
+Como conferir: testar contra uma COPIA do portal.sqlite3 atual e contra um banco
+vazio; os dois devem terminar no mesmo esquema (comparar "sqlite3 x .schema").
+
+
+-------------------------------------------------------------
+3. UM ARQUIVO DE TESTE POR MODULO        (junto com o item 1)
+-------------------------------------------------------------
+Por que: o Nossa Rede deixa o teste ao lado do modulo (lib/eventos.test.ts). Fica
+obvio o que esta coberto e o que nao esta.
+
+Mapa das classes atuais de tests/test_app.py:
+  test_sped.py        <- CnpjTests, SpedHeaderTests, SpedTypeDetectionTests,
+                         SpedSummaryTests
+  test_auth.py        <- PasswordTests, PasswordResetTests, LoginFormTests
+  test_calendario.py  <- PublicationForecastTests
+  test_db.py          <- StorageTests
+  test_handler.py     <- SupportAccessTests, MonitoringDisabledTests,
+                         BranchAccessTests, DashboardSummaryTests, AutoPublishTests
+Helpers comuns (restore_storage, sped(), CNPJs de exemplo) -> tests/util.py.
+
+
+-------------------------------------------------------------
+4. ROTA DE SAUDE E CHECAGEM NO BOOT      (prioridade 3)
+-------------------------------------------------------------
+Por que: o Nossa Rede tem /api/health (faz SELECT 1) e o container so e dado como
+"saudavel" se ela responder; e o boot falha alto se faltar variavel obrigatoria.
+O iniciar-portal.bat hoje decide se o portal esta no ar olhando a porta com
+netstat, o que nao prova que ele responde.
+
+Como:
+- GET /saude, sem login: faz SELECT 1 no SQLite e devolve
+  {"ok": true, "versao": "1.5.0"} (ou 503 com {"ok": false, "erro": "..."}).
+- No main(), antes de servir: conferir que data/ existe e e gravavel, que o
+  .secret existe (ou e criado), que o banco abre e esta na versao de migracao
+  esperada. Se falhar, sair com mensagem clara e codigo de erro diferente de 0.
+- iniciar-portal.bat: trocar a checagem por netstat por
+  "curl.exe -s -m 5 http://127.0.0.1:%PORTAL_PORT%/saude".
+
+Como conferir: apagar a permissao de escrita de uma copia de data/ e ver o portal
+recusar subir com a mensagem certa.
+
+
+-------------------------------------------------------------
+5. BACKUP AUTOMATICO                     (prioridade 3)
+-------------------------------------------------------------
+Por que: hoje ha .bak-AAAA-MM-DD criados a mao DENTRO de data/. Se o disco ou a
+pasta forem perdidos, vai tudo junto. O Nossa Rede faz backup diario as 3h com
+retencao de 14 dias e copia fora do servidor.
+
+Como:
+- scripts/windows/backup.ps1 (ou "python app.py backup"):
+  usar a API de backup do SQLite (sqlite3.Connection.backup), que e segura com o
+  portal rodando - NAO copiar o arquivo com Copy-Item.
+- Destino fora de data/ (outra pasta ou outro disco), nome com data e hora.
+- Copiar junto data/documentos/ (os SPED publicados) e o .secret.
+- Apagar backups com mais de 14 dias.
+- Agendar como tarefa do Windows, igual ao instalar-servico.bat.
+- Depois de funcionar, tirar os .bak antigos de dentro de data/.
+
+Como conferir: restaurar um backup numa pasta separada e subir o portal com
+PORTAL_PORT=8001 apontando para ela.
+
+
+-------------------------------------------------------------
+6. VERSOES E GOVERNANCA DO GIT           (prioridade 2 - e rapido)
+-------------------------------------------------------------
+Por que: no Nossa Rede cada versao publicada tem uma tag e um commit
+correspondente. A regra e: commitar ANTES de colocar no ar, nunca depois. Assim
+qualquer versao pode ser reconstruida e o rollback e pelo git.
+
+Como:
+- Mergear publicacao-automatica-sped em main e criar a tag v1.5.0
+  (git tag -a v1.5.0 -m "Portal Fiscal 1.5.0" && git push origin v1.5.0).
+- Daqui pra frente: uma branch por mudanca, commit -> tag -> publicar.
+- Mensagens no padrao Conventional Commits (feat:, fix:, docs:, refactor:).
+- Opcional: CONTRIBUTING.md e modelo de PR, seguindo o padrao do setor.
+- ATENCAO: o repositorio e PUBLICO no GitHub. Nunca commitar dados de loja,
+  SPED real, banco, .secret, senhas ou enderecos internos de servidor. Avaliar
+  torna-lo privado antes de crescer.
+
+
+-------------------------------------------------------------
+7. ORGANIZACAO DOS SCRIPTS E CREDENCIAIS (prioridade 4)
+-------------------------------------------------------------
+- Mover para scripts/windows/: instalar-servico.bat, remover-servico.bat,
+  criar-usuario-suporte.bat, redefinir-senha.bat (e o backup do item 5).
+  Manter so iniciar-portal.bat na raiz. Atualizar os caminhos no README.
+- Os .bat ajustam "cd /d %~dp0"; depois de mover, apontar para a pasta pai.
+- criar-usuario-suporte grava a senha em texto puro num admin-credentials.txt na
+  Area de Trabalho. Documentar no README que o arquivo deve ser apagado depois
+  que a senha for entregue (ou mostrar a senha so na tela, sem gravar).
+
+
+-------------------------------------------------------------
+8. IDEIAS MENORES (quando sobrar tempo)
+-------------------------------------------------------------
+- Configuracao centralizada com um .env.example documentando PORTAL_HOST,
+  PORTAL_PORT e PORTAL_MONITORAMENTO.
+- Rotacao do logs/portal.log (hoje cresce sem limite).
+- HTML: tirar os blocos grandes de dentro do Python para templates em
+  portal/views/templates/ usando string.Template (continua sem dependencia).
+- Antes de expor fora de 127.0.0.1: proxy reverso com HTTPS e uma revisao de
+  seguranca (o proprio README ja avisa que nao houve auditoria).
+
+
+-------------------------------------------------------------
+ORDEM SUGERIDA DE TRABALHO
+-------------------------------------------------------------
+  [ ] 6  tag v1.5.0 e merge em main (rapido, antes de mexer em estrutura)
+  [ ] 1a calendario.py + test_calendario.py
+  [ ] 1b sped.py + test_sped.py
+  [ ] 1c auth.py + test_auth.py
+  [ ] 1d auditoria.py
+  [ ] 1e config.py + db.py
+  [ ] 2  migracoes numeradas (depende do db.py)
+  [ ] 4  /saude + checagem no boot + iniciar-portal.bat
+  [ ] 1f views/
+  [ ] 1g handler.py
+  [ ] 5  backup agendado
+  [ ] 7  scripts/windows/ e aviso das credenciais
+  [ ] 8  ideias menores
+  [ ] versao 1.6.0: CHANGELOG + docs/versao-1.6.md + tag
+
+Regra para todos os passos: rodar
+  python -m unittest discover -s tests -v
+antes de cada commit.
