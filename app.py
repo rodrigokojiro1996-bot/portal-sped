@@ -39,12 +39,21 @@ READABLE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
 APP_SECRET: bytes | None = None
 
 # Perfis de acesso:
-#   admin   - vê todas as lojas, publica arquivos, cadastra lojas e vê o monitoramento;
-#   support - vê todas as lojas e baixa arquivos (somente consulta); tudo o que faz é registrado;
+#   admin   - vê todas as lojas, publica arquivos, cadastra lojas e, com o monitoramento ativo, vê as ações do suporte;
+#   support - vê todas as lojas e baixa arquivos (somente consulta); com o monitoramento ativo, tudo o que faz é registrado;
 #   store   - vê só as lojas do próprio grupo (mesma raiz de CNPJ).
 USER_ROLES = ("admin", "support", "store")
 STAFF_ROLES = ("admin", "support")
 AUDITED_ROLES = ("support",)
+
+PORTAL_VERSION = "1.5.0"
+
+# Monitoramento do suporte: DESATIVADO a partir da versão 1.5.
+# Desligado, o portal não mostra o item "Monitoramento" na lateral, responde "Página não encontrada" em
+# /monitoramento e /monitoramento.csv, não grava nada em audit_log e não avisa o suporte de que as ações são
+# registradas. O código, a tabela audit_log e o histórico já gravado continuam no lugar.
+# Para reativar: inicie o portal com a variável de ambiente PORTAL_MONITORAMENTO=1.
+MONITORING_ENABLED = os.environ.get("PORTAL_MONITORAMENTO", "0") == "1"
 ROLE_LABELS = {"admin": "Administração", "support": "Suporte", "store": "Acesso da loja"}
 USERS_TABLE_SQL = """CREATE TABLE {name} (
     id INTEGER PRIMARY KEY,
@@ -658,13 +667,18 @@ def short_store_names(stores: list[sqlite3.Row]) -> dict[int, str]:
     return dict(zip((store["id"] for store in stores), resumo_sped.short_labels([store["name"].strip() for store in stores])))
 
 
+# Versão do CSS e do script no endereço de cada um: muda quando o arquivo muda, e o navegador não usa a cópia antiga do cache.
+STYLES_VERSION = hashlib.sha256((ROOT / "static" / "styles.css").read_bytes()).hexdigest()[:10]
+SCRIPT_VERSION = hashlib.sha256((ROOT / "static" / "portal.js").read_bytes()).hexdigest()[:10]
+
+
 def render_page(title: str, content: str, user: sqlite3.Row | None = None) -> bytes:
     nav = ""
     if user:
         nav = (f"<div class='user-chip'><span class='user-mark'>{h(user['name'][:1].upper())}</span><span class='user-text'>{h(user['name'])}<small>{ROLE_LABELS.get(user['role'], '')}</small></span>"
                f"<form method='post' action='/logout'><input type='hidden' name='csrf' value='{h(user['csrf_token'])}'><button class='btn btn-ghost btn-sm' type='submit'>{icon('logout')}<span>Sair</span></button></form></div>")
     brand = "<a class='brand' href='/dashboard'><img class='brand-logo' src='/static/farmacias-associadas-logo.png' alt='Farmácias Associadas'><span class='brand-context'>PORTAL FISCAL</span></a>"
-    return (f"<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='theme-color' content='#087e70'><title>{h(title)} · Portal Fiscal</title><link rel='stylesheet' href='/static/styles.css'></head><body><header class='topbar'>{brand}{nav}</header>{content}<footer class='site-footer'><span>PORTAL FISCAL <i></i> FARMÁCIAS ASSOCIADAS</span><span>Documentos acessíveis somente à loja autorizada.</span></footer></body></html>").encode("utf-8")
+    return (f"<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='theme-color' content='#087e70'><title>{h(title)} · Portal Fiscal</title><link rel='stylesheet' href='/static/styles.css?v={STYLES_VERSION}'><script src='/static/portal.js?v={SCRIPT_VERSION}' defer></script></head><body><header class='topbar'>{brand}{nav}</header>{content}<footer class='site-footer'><span>PORTAL FISCAL <i></i> FARMÁCIAS ASSOCIADAS <i></i> V{PORTAL_VERSION}</span><span>Documentos acessíveis somente à loja autorizada.</span></footer></body></html>").encode("utf-8")
 
 
 class PortalHandler(BaseHTTPRequestHandler):
@@ -784,6 +798,10 @@ class PortalHandler(BaseHTTPRequestHandler):
             css = (ROOT / "static" / "styles.css").read_bytes()
             self.send_bytes(HTTPStatus.OK, css, "text/css; charset=utf-8", {"Cache-Control": "public, max-age=3600"})
             return
+        if path == "/static/portal.js":
+            script = (ROOT / "static" / "portal.js").read_bytes()
+            self.send_bytes(HTTPStatus.OK, script, "text/javascript; charset=utf-8", {"Cache-Control": "public, max-age=3600"})
+            return
         if path == "/static/farmacias-associadas-logo.png":
             logo = (ROOT / "static" / "farmacias-associadas-logo.png").read_bytes()
             self.send_bytes(HTTPStatus.OK, logo, "image/png", {"Cache-Control": "public, max-age=86400"})
@@ -807,7 +825,7 @@ class PortalHandler(BaseHTTPRequestHandler):
             self.dashboard_workspace(user)
         elif path.startswith("/download/"):
             self.download(user, path.removeprefix("/download/"))
-        elif path in ("/monitoramento", "/monitoramento.csv"):
+        elif MONITORING_ENABLED and path in ("/monitoramento", "/monitoramento.csv"):
             if user["role"] != "admin":
                 self.audit(user, "acao_bloqueada", detail="abrir o monitoramento do suporte")
                 self.send_page(HTTPStatus.FORBIDDEN, "Acesso negado", "<main class='content'><h1>Área restrita à administração.</h1></main>", user)
@@ -866,8 +884,9 @@ class PortalHandler(BaseHTTPRequestHandler):
         if message:
             main += f"<div class='notice' role='status'>{h(message)}</div>"
         if user["role"] == "support":
+            recorded = " As ações deste acesso são registradas." if MONITORING_ENABLED else ""
             main += (f"<div class='notice notice-info' role='note'>{icon('eye')}<span><strong>Acesso de suporte:</strong> consulta de todas as lojas e download de arquivos. "
-                     "Para publicar arquivos ou cadastrar lojas, fale com a administração. As ações deste acesso são registradas.</span></div>")
+                     f"Para publicar arquivos ou cadastrar lojas, fale com a administração.{recorded}</span></div>")
         if selected_store:
             main += self.page_heading(f"{label} · {subject}", selected_store["name"], f"CNPJ {format_cnpj(selected_store['cnpj'])}")
         elif admin:
@@ -949,7 +968,7 @@ class PortalHandler(BaseHTTPRequestHandler):
             f"<span class='tab-mark'>{mark}</span><span class='tab-text'>{label}<small>{subject}</small></span></a>"
             for key, (label, subject, mark) in DOCUMENT_TYPES.items())
         navigation = f"<nav class='sped-navigation' aria-label='Tipo de arquivo'><span class='side-section-label'>ARQUIVOS</span>{tabs}</nav>"
-        if admin:
+        if admin and MONITORING_ENABLED:
             navigation += (f"<nav class='sped-navigation' aria-label='Administração'><span class='side-section-label'>ADMINISTRAÇÃO</span>"
                            f"<a class='sped-tab{current if section == 'monitoramento' else ''}' href='/monitoramento'><span class='tab-mark'>{icon('eye')}</span>"
                            "<span class='tab-text'>Monitoramento<small>Ações do suporte</small></span></a></nav>")
@@ -1172,7 +1191,7 @@ class PortalHandler(BaseHTTPRequestHandler):
 
         Abrir a mesma tela de novo em menos de 1 minuto (recarregar, voltar) não gera registro repetido.
         """
-        if not user or user["role"] not in AUDITED_ROLES:
+        if not MONITORING_ENABLED or not user or user["role"] not in AUDITED_ROLES:
             return
         now = datetime.now().astimezone()
         store_id = store["id"] if store else None
@@ -1320,10 +1339,10 @@ def main() -> None:
             raise SystemExit(str(error)) from error
         print(f"Usuário de suporte criado: {login_name} ({name})")
         print(f"Senha: {password}")
-        print("Acesso: todas as lojas, somente consulta e download. As ações ficam registradas no monitoramento da administração.")
+        print("Acesso: todas as lojas, somente consulta e download." + (" As ações ficam registradas no monitoramento da administração." if MONITORING_ENABLED else ""))
         if target:
             block = (f"\nPORTAL FISCAL - ACESSO SUPORTE\nUsuário: {login_name}\nSenha: {password}\n"
-                     "Perfil: consulta de todas as lojas e download de arquivos. Não publica nem cadastra. Ações registradas no monitoramento.\n")
+                     "Perfil: consulta de todas as lojas e download de arquivos. Não publica nem cadastra." + (" Ações registradas no monitoramento." if MONITORING_ENABLED else "") + "\n")
             with open(target, "a", encoding="utf-8") as handle:
                 handle.write(block)
             print(f"Credencial adicionada em: {target}")
@@ -1348,7 +1367,7 @@ def main() -> None:
     host = os.environ.get("PORTAL_HOST", "127.0.0.1")
     port = int(os.environ.get("PORTAL_PORT", "8000"))
     server = ThreadingHTTPServer((host, port), PortalHandler)
-    print(f"Portal Fiscal ativo em http://{host}:{port}")
+    print(f"Portal Fiscal {PORTAL_VERSION} ativo em http://{host}:{port} (monitoramento do suporte {'ativo' if MONITORING_ENABLED else 'desativado'})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

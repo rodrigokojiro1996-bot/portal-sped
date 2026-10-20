@@ -1,5 +1,7 @@
 # Portal Fiscal | Farmácias Associadas
 
+Versão atual: **1.5.0**. Veja o [CHANGELOG](CHANGELOG.md) e a [documentação técnica da 1.5](docs/versao-1.5.md).
+
 Aplicação privada para publicar arquivos SPED EFD por loja, tipo e competência. Depois do acesso, a lateral identifica a loja e o CNPJ e oferece as áreas SPED Fiscal e SPED Contribuições. O administrador cadastra os acessos e envia os arquivos; cada loja pode consultar os próprios documentos e, quando vinculada a filiais, alternar entre elas sem encerrar a sessão.
 
 > A primeira versão roda com Python 3.11 ou superior, sem pacotes externos. O portal é uma base funcional para validação do fluxo e não passou por auditoria independente de segurança. Não o exponha à internet nem use dados fiscais reais em produção antes de seguir as recomendações de implantação abaixo.
@@ -31,7 +33,7 @@ Cada instalação deve criar seu próprio administrador e cadastrar suas lojas. 
 
 | Perfil | Entra com | Vê | Pode |
 | --- | --- | --- | --- |
-| Administração | usuário (ex.: `admin.fa`) | todas as lojas e o monitoramento do suporte | publicar arquivos, cadastrar lojas, baixar |
+| Administração | usuário (ex.: `admin.fa`) | todas as lojas (e o monitoramento do suporte, quando ativo) | publicar arquivos, cadastrar lojas, baixar |
 | Suporte | usuário (ex.: `suporte`) | todas as lojas | só consultar e baixar arquivos |
 | Loja | CNPJ | as lojas do próprio grupo (mesma raiz de CNPJ) | consultar e baixar |
 
@@ -43,9 +45,18 @@ python app.py criar-suporte suporte "Suporte Farmácias Associadas" --salvar-em 
 
 Para trocar a senha de uma loja ou do suporte, use `redefinir-senha.bat`, informando o CNPJ da loja ou o usuário do suporte.
 
-### Monitoramento do suporte
+### Monitoramento do suporte (desativado na 1.5)
 
-Tudo o que um usuário de suporte faz fica registrado. A administração consulta em **Monitoramento**, na barra lateral:
+A partir da versão 1.5 o monitoramento vem **desligado**: não aparece na lateral, `/monitoramento` responde "Página não encontrada", nenhuma ação do suporte é gravada e o suporte não vê o aviso de registro. O código, a tabela `audit_log` e o histórico já gravado continuam no lugar. Para reativar, inicie o portal com a variável `PORTAL_MONITORAMENTO=1`:
+
+```powershell
+$env:PORTAL_MONITORAMENTO = '1'
+python app.py
+```
+
+No `iniciar-portal.bat`, acrescente `set "PORTAL_MONITORAMENTO=1"` junto das outras variáveis.
+
+Com o monitoramento ativo, tudo o que um usuário de suporte faz fica registrado. A administração consulta em **Monitoramento**, na barra lateral:
 
 - entradas e saídas do portal e tentativas com a senha errada;
 - cada loja consultada, com o tipo de SPED e o mês;
@@ -142,6 +153,8 @@ Proteja o diretório com permissões do sistema operacional e faça backups crip
 | `PORTAL_PORT` | `8000` | Porta HTTP local. |
 | `PORTAL_DATA_DIR` | `data/` | Diretório privado para banco, segredo e arquivos. |
 | `COOKIE_SECURE` | `0` | Use `1` somente quando HTTPS estiver configurado no proxy reverso. |
+| `PORTAL_MONITORAMENTO` | `0` | Use `1` para reativar o monitoramento do suporte (desligado desde a 1.5). |
+| `PORTAL_PREVISAO_ATE` | `2026-12` | Último mês (`AAAA-MM`) mostrado na previsão de publicação. |
 
 Exemplo PowerShell para HTTPS terminado em um proxy local:
 

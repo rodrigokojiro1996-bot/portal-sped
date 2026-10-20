@@ -88,9 +88,14 @@ class StorageTests(unittest.TestCase):
 
 
 class SupportAccessTests(unittest.TestCase):
-    """Perfil de suporte: vê todas as lojas, só consulta e baixa; tudo fica registrado para a administração."""
+    """Perfil de suporte com o monitoramento ativo: vê todas as lojas, só consulta e baixa; tudo fica registrado.
+
+    O monitoramento vem desativado desde a versão 1.5; estes testes o ligam para manter a função pronta para reativação.
+    """
 
     def setUp(self):
+        self.monitoring = app.MONITORING_ENABLED
+        app.MONITORING_ENABLED = True
         self.temporary = tempfile.TemporaryDirectory()
         app.configure_storage(Path(self.temporary.name))
         app.create_user("11222333000181", "Loja Exemplo A", "store", "senha-loja-a-123")
@@ -116,6 +121,7 @@ class SupportAccessTests(unittest.TestCase):
         self.thread.join()
         restore_storage()
         self.temporary.cleanup()
+        app.MONITORING_ENABLED = self.monitoring
 
     def request(self, token, path, data=None):
         from urllib.parse import urlencode
@@ -216,6 +222,49 @@ class SupportAccessTests(unittest.TestCase):
                     self.assertEqual(db.execute("SELECT role FROM users WHERE login_name='suporte.migrado'").fetchone()[0], "support")
             finally:
                 restore_storage()
+
+
+class MonitoringDisabledTests(unittest.TestCase):
+    """Versão 1.5: o monitoramento do suporte fica desligado por padrão, sem tela, sem registro e sem aviso."""
+
+    setUp_base, tearDown, request, log = SupportAccessTests.setUp, SupportAccessTests.tearDown, SupportAccessTests.request, SupportAccessTests.log
+
+    def setUp(self):
+        self.setUp_base()
+        app.MONITORING_ENABLED = False
+
+    def test_monitoring_is_off_unless_environment_variable_turns_it_on(self):
+        import os
+        import subprocess
+        import sys
+        for value, expected in ((None, "False"), ("0", "False"), ("1", "True")):
+            with self.subTest(PORTAL_MONITORAMENTO=value):
+                env = {key: item for key, item in os.environ.items() if key != "PORTAL_MONITORAMENTO"}
+                if value is not None:
+                    env["PORTAL_MONITORAMENTO"] = value
+                result = subprocess.run([sys.executable, "-c", "import app; print(app.MONITORING_ENABLED)"], cwd=app.ROOT, env=env, capture_output=True, text=True, check=True)
+                self.assertEqual(result.stdout.strip(), expected)
+
+    def test_admin_has_no_monitoring_menu_and_pages_are_not_found(self):
+        status, page = self.request("admin-session", "/dashboard")
+        self.assertEqual(status, 200)
+        self.assertNotIn("/monitoramento", page.decode())
+        self.assertEqual(self.request("admin-session", "/monitoramento")[0], 404)
+        self.assertEqual(self.request("admin-session", "/monitoramento.csv")[0], 404)
+
+    def test_support_actions_are_not_recorded_and_support_is_not_told_they_are(self):
+        status, page = self.request("support-session", "/dashboard")
+        self.assertEqual(status, 200)
+        self.assertIn("Acesso de suporte:", page.decode())
+        self.assertNotIn("são registradas", page.decode())
+        self.assertEqual(self.request("support-session", "/download/doc-b")[1], b"conteudo do sped da loja b")
+        self.assertEqual(self.request("support-session", "/upload", {"csrf": "csrf-support-session"})[0], 403)
+        self.assertEqual(self.request("support-session", "/monitoramento")[0], 404)
+        self.assertEqual(self.log(), [])
+
+    def test_footer_shows_portal_version(self):
+        self.assertEqual(app.PORTAL_VERSION, "1.5.0")
+        self.assertIn("V1.5.0", self.request("admin-session", "/dashboard")[1].decode())
 
 
 class PasswordResetTests(unittest.TestCase):
@@ -687,6 +736,38 @@ class AutoPublishTests(unittest.TestCase):
         status, _, _ = self.post_file(sped(FISCAL_SAMPLE), csrf="token-errado")
         self.assertEqual(status, 403)
         self.assertEqual(self.documents(), [])
+
+    def test_popup_disappears_when_closed(self):
+        # "OK, entendi" fecha o <dialog> tirando o atributo open; o CSS não pode manter o pop-up visível sem ele.
+        css = (app.ROOT / "static" / "styles.css").read_text(encoding="utf-8")
+        self.assertIn(".publish-dialog:not([open]){display:none}", css)
+        status, _, page = self.post_file(sped(FISCAL_SAMPLE))
+        self.assertEqual(status, 200)
+        self.assertIn("<form method='dialog'><button", page)
+
+    def test_stylesheet_address_changes_with_its_content_so_browser_cache_is_refreshed(self):
+        with urlopen(Request(self.base + "/dashboard", headers={"Cookie": "portal_session=admin-session"})) as response:
+            page = response.read().decode()
+        self.assertIn(f"href='/static/styles.css?v={app.STYLES_VERSION}'", page)
+        expected = hashlib.sha256((app.ROOT / "static" / "styles.css").read_bytes()).hexdigest()[:10]
+        self.assertEqual(app.STYLES_VERSION, expected)
+        with urlopen(self.base + f"/static/styles.css?v={app.STYLES_VERSION}") as response:
+            self.assertIn(b".publish-dialog:not([open])", response.read())
+
+    def test_popup_closes_with_escape_key(self):
+        # O Esc só fecha um <dialog> aberto como modal; o script reabre o pop-up com showModal() e ainda trata o Esc.
+        status, _, page = self.post_file(sped(FISCAL_SAMPLE))
+        self.assertEqual(status, 200)
+        self.assertIn(f"<script src='/static/portal.js?v={app.SCRIPT_VERSION}' defer></script>", page)
+        with urlopen(self.base + f"/static/portal.js?v={app.SCRIPT_VERSION}") as response:
+            self.assertEqual(response.headers["Content-Type"], "text/javascript; charset=utf-8")
+            script = response.read().decode()
+        self.assertIn("dialog.publish-dialog[open]", script)
+        self.assertIn("showModal()", script)
+        self.assertIn('event.key !== "Escape"', script)
+        # A CSP bloqueia script inline; o pop-up precisa funcionar só com o arquivo externo.
+        self.assertNotIn("<script>", page)
+        self.assertNotIn("onclick", page)
 
     def test_popup_only_appears_right_after_publishing(self):
         _, url, _ = self.post_file(sped(FISCAL_SAMPLE))
