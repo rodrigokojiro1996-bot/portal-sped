@@ -6,9 +6,11 @@ o leem como db.DOCUMENTS etc., na hora do uso, para que configure_storage() (e o
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
@@ -18,6 +20,10 @@ DATA_DIR = config.DATA_DIR
 DATABASE = DATA_DIR / "portal.sqlite3"
 DOCUMENTS = DATA_DIR / "documentos"
 APP_SECRET: bytes | None = None
+
+MIGRATIONS_DIR = config.ROOT / "migrations"
+# Esquema da versão 1.5, a última sem migrações numeradas: equivale a 001 + 002.
+PRE_MIGRATION_VERSION = 2
 
 USERS_TABLE_SQL = """CREATE TABLE {name} (
     id INTEGER PRIMARY KEY,
@@ -59,7 +65,7 @@ def configure_storage(data_dir: Path | None = None) -> None:
         except OSError:
             pass
     APP_SECRET = secret_path.read_bytes()
-    initialize_database()
+    migrate()
 
 
 def ensure_secret() -> bytes:
@@ -85,7 +91,78 @@ def connect() -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
-def migrate_user_roles() -> None:
+def migration_files() -> list[tuple[int, str, Path]]:
+    """Arquivos migrations/NNN_nome.sql, em ordem. A numeração precisa ser contínua a partir de 001."""
+    files = []
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        match = re.fullmatch(r"(\d{3})_([a-z0-9_]+)\.sql", path.name)
+        if not match:
+            raise RuntimeError(f"Nome de migração fora do padrão NNN_nome.sql: {path.name}")
+        files.append((int(match[1]), match[2], path))
+    if [number for number, _, _ in files] != list(range(1, len(files) + 1)):
+        raise RuntimeError("As migrações precisam ser numeradas em sequência a partir de 001.")
+    return files
+
+
+def latest_version() -> int:
+    return len(migration_files())
+
+
+def schema_version() -> int:
+    """Versão de migração do banco atual (0 se o banco não tiver a tabela schema_version)."""
+    connection = sqlite3.connect(DATABASE, timeout=10)
+    try:
+        exists = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone()
+        return connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_version").fetchone()[0] if exists else 0
+    finally:
+        connection.close()
+
+
+def migrate() -> list[int]:
+    """Aplica, em ordem, as migrações com número maior que a versão do banco. Devolve as que aplicou.
+
+    Cada migração roda numa transação, com as chaves estrangeiras desligadas (como o SQLite pede para recriar
+    tabelas) e conferidas antes do COMMIT. Se algo falhar, a migração inteira é desfeita.
+    """
+    files = migration_files()
+    connection = sqlite3.connect(DATABASE, timeout=10, isolation_level=None)
+    try:
+        connection.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)")
+        current = connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_version").fetchone()[0]
+        has_tables = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'").fetchone()
+        if current == 0 and has_tables:
+            _adopt_pre_migration_database()
+            now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            for number, name, _ in files[:PRE_MIGRATION_VERSION]:
+                connection.execute("INSERT INTO schema_version VALUES (?, ?, ?)", (number, name, f"{now} (banco anterior às migrações)"))
+            current = PRE_MIGRATION_VERSION
+        applied = []
+        for number, name, path in files:
+            if number <= current:
+                continue
+            now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            connection.execute("PRAGMA foreign_keys = OFF")
+            try:
+                script = path.read_text(encoding="utf-8")
+                connection.executescript(f"BEGIN IMMEDIATE;\n{script}\nINSERT INTO schema_version VALUES ({number}, '{name}', '{now}');\n")
+                if connection.execute("PRAGMA foreign_key_check").fetchall():
+                    raise sqlite3.IntegrityError(f"Referências inválidas depois da migração {path.name}.")
+                connection.execute("COMMIT")
+            except Exception:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            finally:
+                connection.execute("PRAGMA foreign_keys = ON")
+            applied.append(number)
+        return applied
+    finally:
+        connection.close()
+
+
+# --------------------------------------------------------------------------- bancos anteriores às migrações
+
+def _legacy_user_roles() -> None:
     """Bancos antigos só aceitavam os perfis admin e store: recria a tabela de usuários com o perfil support.
 
     Segue o procedimento do SQLite para alterar uma restrição (chaves estrangeiras desligadas durante a troca).
@@ -115,10 +192,15 @@ def migrate_user_roles() -> None:
         connection.close()
 
 
-def initialize_database() -> None:
+def _adopt_pre_migration_database() -> None:
+    """Leva um banco criado antes das migrações numeradas (até a 1.5) ao esquema da 1.5.
+
+    É o reparo que a 1.5 fazia a cada abertura; agora roda uma única vez, e o banco passa a
+    ser controlado por schema_version a partir da versão PRE_MIGRATION_VERSION.
+    """
     with connect() as db:
         db.execute(USERS_TABLE_SQL.format(name="IF NOT EXISTS users"))
-    migrate_user_roles()
+    _legacy_user_roles()
     with connect() as db:
         db.executescript(
             """

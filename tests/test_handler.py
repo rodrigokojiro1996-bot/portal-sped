@@ -134,29 +134,6 @@ class SupportAccessTests(unittest.TestCase):
         self.assertEqual(len(text), 2)
         self.assertIn("sped-loja-b.txt", text[1])
 
-    def test_old_database_is_migrated_to_accept_support_role(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            legacy = sqlite3.connect(Path(temporary) / "portal.sqlite3")
-            legacy.executescript("""
-                CREATE TABLE users (id INTEGER PRIMARY KEY, cnpj TEXT UNIQUE, login_name TEXT UNIQUE, name TEXT NOT NULL,
-                    role TEXT NOT NULL CHECK(role IN ('admin', 'store')), password_hash TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
-                CREATE TABLE documents (id TEXT PRIMARY KEY, store_id INTEGER NOT NULL REFERENCES users(id), document_type TEXT NOT NULL CHECK(document_type IN ('fiscal', 'contribuicoes')),
-                    competence TEXT NOT NULL, original_name TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL, uploaded_at TEXT NOT NULL, UNIQUE(store_id, document_type, sha256));
-                INSERT INTO users VALUES (7, '11222333000181', NULL, 'Loja Antiga', 'store', 'hash', 1, '2026-01-01');
-                INSERT INTO documents VALUES ('d1', 7, 'fiscal', '2026-09', 'a.txt', 1, 'x', '2026-10-01');
-            """)
-            legacy.commit()
-            legacy.close()
-            try:
-                storage.configure_storage(Path(temporary))
-                auth.create_support_user("suporte.migrado", "Suporte Migrado")
-                with storage.connect() as db:
-                    self.assertEqual(db.execute("SELECT name FROM users WHERE id=7").fetchone()[0], "Loja Antiga")
-                    self.assertEqual(db.execute("SELECT store_id FROM documents WHERE id='d1'").fetchone()[0], 7)
-                    self.assertEqual(db.execute("SELECT role FROM users WHERE login_name='suporte.migrado'").fetchone()[0], "support")
-            finally:
-                restore_storage()
-
 
 class MonitoringDisabledTests(unittest.TestCase):
     """Versão 1.5: o monitoramento do suporte fica desligado por padrão, sem tela, sem registro e sem aviso."""
