@@ -67,7 +67,7 @@ class PublishRulesTests(unittest.TestCase):
 
     def test_invalid_files_are_refused_with_the_reason(self):
         cases = {
-            "período parcial": (sped(FISCAL_SAMPLE, period="02092026|30092026"), "mês-calendário completo"),
+            "período em dois meses": (sped(FISCAL_SAMPLE, period="16092026|15102026"), "único mês"),
             "CNPJ inválido": (sped(FISCAL_SAMPLE, "11222333000182"), "CNPJ inválido"),
             "não é SPED": (b"qualquer texto\r\n", "não foi reconhecido"),
             "vazio": (b"", "Escolha um arquivo"),
@@ -77,6 +77,60 @@ class PublishRulesTests(unittest.TestCase):
                 with self.assertRaisesRegex(PublishError, reason):
                     publicacao.publish_sped(content, "sped.txt")
         self.assertEqual(self.stored_files(), [])
+
+
+class PartialPeriodTests(unittest.TestCase):
+    """SPED de parte do mês (ex.: Fiscal quinzenal): aceito, na competência do mês, e somado no resumo do mês."""
+
+    def setUp(self):
+        temporary_storage(self)
+        auth.create_user(STORE_A_CNPJ, "Farmácia Centro", "store", "senha-centro-123")
+
+    def documents(self):
+        with storage.connect() as db:
+            return db.execute("SELECT * FROM documents WHERE document_type='fiscal' ORDER BY uploaded_at").fetchall()
+
+    def test_both_fortnights_are_published_in_the_same_competence(self):
+        first = publicacao.publish_sped(sped(FISCAL_SAMPLE, period="01092026|15092026"), "ipi-1a-quinzena.txt")
+        second = publicacao.publish_sped(sped(FISCAL_SAMPLE, period="16092026|30092026"), "ipi-2a-quinzena.txt")
+        self.assertEqual((first["competence"], first["partial"], first["period_end"]), ("2026-09", True, "2026-09-15"))
+        self.assertEqual((second["competence"], second["partial"], second["period_start"]), ("2026-09", True, "2026-09-16"))
+        stored = [(doc["competence"], doc["period_start"], doc["period_end"]) for doc in self.documents()]
+        self.assertEqual(stored, [("2026-09", "2026-09-01", "2026-09-15"), ("2026-09", "2026-09-16", "2026-09-30")])
+
+    def test_full_month_file_keeps_its_period_and_is_not_partial(self):
+        published = publicacao.publish_sped(sped(FISCAL_SAMPLE), "mes.txt")
+        self.assertFalse(published["partial"])
+        self.assertFalse(publicacao.is_partial(self.documents()[0]))
+
+    def test_month_summary_adds_up_the_fortnights(self):
+        publicacao.publish_sped(sped(FISCAL_SAMPLE, period="01092026|15092026"), "1.txt")
+        one = publicacao.competence_summary(self.documents(), "2026-09")
+        publicacao.publish_sped(sped(FISCAL_SAMPLE, period="16092026|30092026"), "2.txt")
+        both = publicacao.competence_summary(self.documents(), "2026-09")
+        self.assertEqual(one["operacoes"]["saidas"]["valor"], 150)
+        self.assertEqual(both["operacoes"]["saidas"]["valor"], 300)
+        self.assertEqual(both["operacoes"]["saidas"]["documentos"], 4)
+        self.assertAlmostEqual(both["apuracao"]["icms"]["recolher"], 10.2)
+        self.assertAlmostEqual(both["apuracao"]["icms_st_recolher"], 3.0)
+        self.assertEqual(len(both["apuracao"]["obrigacoes"]), 2)
+
+    def test_corrected_fortnight_replaces_the_previous_one_instead_of_adding(self):
+        publicacao.publish_sped(sped(FISCAL_SAMPLE, period="01092026|15092026"), "1.txt")
+        publicacao.publish_sped(sped(FISCAL_SAMPLE, period="16092026|30092026"), "2.txt")
+        corrected = sped(FISCAL_SAMPLE, period="01092026|15092026") + b"|C100|1|0||65|00|1|900||10092026|10092026|50|0|0|0|50|9|0|0|0|0|0|0|0|0|0|0|0|0|\r\n|C190|060|5405|0|50|0|0|0|0|0|0||\r\n"
+        publicacao.publish_sped(corrected, "1-corrigido.txt")
+        summary = publicacao.competence_summary(self.documents(), "2026-09")
+        self.assertEqual(len(self.documents()), 3)
+        self.assertEqual(summary["operacoes"]["saidas"]["valor"], 350)   # 200 da 1ª corrigida + 150 da 2ª
+
+    def test_partial_contributions_are_accepted_too(self):
+        published = publicacao.publish_sped(sped(CONTRIBUTIONS_SAMPLE, period="01092026|15092026"), "contrib-parcial.txt")
+        self.assertEqual((published["document_type"], published["competence"], published["partial"]), ("contribuicoes", "2026-09", True))
+
+    def test_period_crossing_two_months_is_still_refused(self):
+        with self.assertRaisesRegex(PublishError, "único mês"):
+            publicacao.publish_sped(sped(FISCAL_SAMPLE, period="16092026|15102026"), "x.txt")
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ from __future__ import annotations
 import sqlite3
 
 import resumo_sped
-from portal.sped import format_cnpj, sped_label
+from portal.sped import format_cnpj, period_label, sped_label
 from portal.views.layout import h, icon
 
 
@@ -20,9 +20,13 @@ def publish_dialog(success: bool, message: str, details: list[tuple[str, str]] |
 
 
 def published_dialog(document: sqlite3.Row) -> str:
-    """Confirmação depois da publicação: tipo do SPED, loja, CNPJ e competência lidos do arquivo."""
+    """Confirmação depois da publicação: tipo do SPED, loja, CNPJ, competência e, se for parte do mês, o período."""
     label = sped_label(document["document_type"])
     month = resumo_sped.month_label(document["competence"]).capitalize()
-    message = f"O arquivo {label} foi publicado com sucesso na loja {document['store_name']}, CNPJ {format_cnpj(document['store_cnpj'])}, competência {month}."
-    return publish_dialog(True, message, [("Tipo", label), ("Loja", document["store_name"]), ("CNPJ", format_cnpj(document["store_cnpj"])),
-                                          ("Competência", month), ("Arquivo", document["original_name"])])
+    period = period_label(document["period_start"], document["period_end"])
+    when = f"competência {month}" + (f" (período parcial de {period})" if period else "")
+    message = f"O arquivo {label} foi publicado com sucesso na loja {document['store_name']}, CNPJ {format_cnpj(document['store_cnpj'])}, {when}."
+    details = [("Tipo", label), ("Loja", document["store_name"]), ("CNPJ", format_cnpj(document["store_cnpj"])), ("Competência", month)]
+    if period:
+        details.append(("Período", f"{period} (parcial)"))
+    return publish_dialog(True, message, details + [("Arquivo", document["original_name"])])

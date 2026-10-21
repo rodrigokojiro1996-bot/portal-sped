@@ -17,7 +17,7 @@ import resumo_sped
 from portal import config
 from portal import db as storage
 from portal.db import connect
-from portal.sped import PublishError, detect_sped_type, format_cnpj, parse_sped_header, sped_label
+from portal.sped import PublishError, detect_sped_type, format_cnpj, parse_sped_header, period_label, sped_label
 
 
 def publish_sped(content: bytes, file_name: str) -> dict[str, str | int]:
@@ -46,15 +46,17 @@ def publish_sped(content: bytes, file_name: str) -> dict[str, str | int]:
         except OSError:
             pass
         try:
-            db.execute("INSERT INTO documents (id, store_id, document_type, competence, original_name, size, sha256, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                       (doc_id, store["id"], document_type, header["competence"], filename, len(content), hashlib.sha256(content).hexdigest(), datetime.now(timezone.utc).isoformat()))
+            db.execute("INSERT INTO documents (id, store_id, document_type, competence, original_name, size, sha256, uploaded_at, period_start, period_end) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                       (doc_id, store["id"], document_type, header["competence"], filename, len(content), hashlib.sha256(content).hexdigest(), datetime.now(timezone.utc).isoformat(),
+                        header["period_start"], header["period_end"]))
         except sqlite3.IntegrityError as error:
             document_path.unlink(missing_ok=True)
             raise PublishError(f"Este arquivo já está publicado no {label} da loja {store['name']} (CNPJ {format_cnpj(store['cnpj'])}). Nada foi alterado.") from error
     with connect() as db:
         document = db.execute("SELECT * FROM documents WHERE id=?", (doc_id,)).fetchone()
     document_summary(document)
-    return {"id": doc_id, "store_id": store["id"], "store_name": store["name"], "cnpj": store["cnpj"], "document_type": document_type, "competence": header["competence"]}
+    return {"id": doc_id, "store_id": store["id"], "store_name": store["name"], "cnpj": store["cnpj"], "document_type": document_type, "competence": header["competence"],
+            "period_start": header["period_start"], "period_end": header["period_end"], "partial": header["partial"]}
 
 
 def document_summary(document: sqlite3.Row) -> dict | None:
@@ -76,6 +78,52 @@ def document_summary(document: sqlite3.Row) -> dict | None:
     return summary
 
 
+def is_partial(document: sqlite3.Row) -> bool:
+    """Arquivo de parte do mês (ex.: quinzenal). Arquivos sem período gravado (anteriores à 1.6) contam como mês inteiro."""
+    return bool(period_label(document["period_start"], document["period_end"]))
+
+
+def partial_set(documents: list[sqlite3.Row]) -> list[sqlite3.Row]:
+    """Arquivos parciais que formam o mês, sem sobreposição: o mais recente de cada período vale.
+
+    Um reenvio corrigido da 1ª quinzena substitui o anterior em vez de somar duas vezes.
+    """
+    chosen: list[sqlite3.Row] = []
+    for document in sorted((doc for doc in documents if is_partial(doc)), key=lambda doc: doc["uploaded_at"], reverse=True):
+        if all(document["period_end"] < other["period_start"] or document["period_start"] > other["period_end"] for other in chosen):
+            chosen.append(document)
+    return sorted(chosen, key=lambda doc: doc["period_start"])
+
+
+_combined_cache: dict[tuple, dict | None] = {}
+
+
+def combined_summary(documents: list[sqlite3.Row]) -> dict | None:
+    """Resumo de vários arquivos parciais do mesmo mês, somados como se fossem um arquivo só (em ordem de período)."""
+    if len(documents) == 1:
+        return document_summary(documents[0])
+    key = (resumo_sped.SUMMARY_VERSION, *(doc["id"] for doc in documents))
+    if key not in _combined_cache:
+        lines: list[str] = []
+        try:
+            for document in documents:
+                lines += resumo_sped.read_lines(storage.DOCUMENTS / (document["id"] + ".txt"))
+            summary = resumo_sped.summarize_lines(lines, documents[0]["document_type"])
+        except (OSError, ValueError, IndexError):
+            summary = None
+        if len(_combined_cache) > 256:
+            _combined_cache.clear()
+        _combined_cache[key] = summary
+    return _combined_cache[key]
+
+
 def competence_summary(documents: list[sqlite3.Row], competence: str) -> dict | None:
+    """Resumo do mês. Arquivos do mês inteiro entram como antes (cada seção vem do mais recente que a tem);
+    os parciais do mês são somados e entram como se fossem um arquivo, na posição do mais recente deles."""
     published = sorted((doc for doc in documents if doc["competence"] == competence), key=lambda doc: doc["uploaded_at"])
-    return resumo_sped.merge([summary for summary in (document_summary(doc) for doc in published) if summary])
+    entries = [(doc["uploaded_at"], document_summary(doc)) for doc in published if not is_partial(doc)]
+    partial = partial_set(published)
+    if partial:
+        entries.append((max(doc["uploaded_at"] for doc in partial), combined_summary(partial)))
+    entries.sort(key=lambda entry: entry[0])
+    return resumo_sped.merge([summary for _, summary in entries if summary])

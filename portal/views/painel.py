@@ -8,7 +8,7 @@ import resumo_sped
 from portal import config
 from portal.auth import STAFF_ROLES
 from portal.calendario import LARGE_GROUP_BUSINESS_DAY, LARGE_GROUP_NOTE, SMALL_GROUP_BUSINESS_DAY, SMALL_GROUP_UNITS, publication_deadline
-from portal.sped import DOCUMENT_TYPES, format_cnpj, normalize_cnpj
+from portal.sped import DOCUMENT_TYPES, format_cnpj, normalize_cnpj, period_label
 from portal.views.layout import dashboard_link, file_size, h, help_tip, icon, short_store_names
 
 CURRENT = " active' aria-current='page"
@@ -98,11 +98,17 @@ def forecast_card(document_type: str, competence: str, units: int) -> str:
             f"<span class='section-kicker'>{kicker}</span><h2>Até {deadline:%d/%m/%Y}</h2><p>{h(text)}</p>{rule}</div></div></section>")
 
 
+def period_note(document: sqlite3.Row) -> str:
+    """Texto do período para arquivos de parte do mês (ex.: quinzenal); vazio para o mês inteiro."""
+    period = period_label(document["period_start"], document["period_end"])
+    return f"Período {period}" if period else ""
+
+
 def files_card(documents: list[sqlite3.Row], competence: str) -> str:
-    files = [doc for doc in documents if doc["competence"] == competence]
+    files = sorted((doc for doc in documents if doc["competence"] == competence), key=lambda doc: (doc["period_start"] or "", doc["uploaded_at"]))
     rows = "".join(
         f"<li class='file-row'><span class='file-icon'>{icon('file')}</span><div class='file-info'><strong title='{h(doc['original_name'])}'>{h(doc['original_name'])}</strong>"
-        f"<small>Publicado em {h(datetime.fromisoformat(doc['uploaded_at']).strftime('%d/%m/%Y'))} · {h(file_size(doc['size']))}</small></div>"
+        f"<small>{h(period_note(doc) + ' · ') if period_note(doc) else ''}Publicado em {h(datetime.fromisoformat(doc['uploaded_at']).strftime('%d/%m/%Y'))} · {h(file_size(doc['size']))}</small></div>"
         f"<a class='btn btn-primary btn-sm' href='/download/{h(doc['id'])}' aria-label='Baixar {h(doc['original_name'])}'>{icon('download')}<span>Baixar</span></a></li>"
         for doc in files)
     total = f"{len(files)} {'arquivo' if len(files) == 1 else 'arquivos'}"
@@ -128,7 +134,8 @@ def admin_tools(user: sqlite3.Row, selected_store: sqlite3.Row | None) -> str:
     csrf = h(user["csrf_token"])
     upload = (f"<div class='panel'><div class='panel-title'><span class='panel-icon upload-icon'>{icon('upload')}</span><div><span class='section-kicker'>PUBLICAR · FISCAL OU CONTRIBUIÇÕES</span><h2>Enviar arquivo SPED</h2></div></div>"
               "<p class='panel-copy'>Escolha o arquivo e publique. O portal lê o registro 0000 e identifica sozinho o tipo (Fiscal ICMS/IPI ou Contribuições PIS/COFINS), "
-              "a loja pelo CNPJ e a competência. Depois anexa o arquivo na aba certa da loja.</p>"
+              "a loja pelo CNPJ e a competência. Depois anexa o arquivo na aba certa da loja. Arquivos de parte do mês (ex.: SPED Fiscal quinzenal) "
+              "também são aceitos; a competência é o mês do período.</p>"
               f"<form method='post' enctype='multipart/form-data' action='/upload' class='stack-form'><input type='hidden' name='csrf' value='{csrf}'>"
               "<label>Arquivo .txt<input class='file-input' name='file' type='file' accept='.txt,text/plain' required><small class='field-help'>Até 40 MB. A loja precisa estar cadastrada com o CNPJ do arquivo.</small></label>"
               f"<button class='btn btn-primary' type='submit'>{icon('upload')}<span>Validar e publicar</span></button></form></div>")
@@ -158,7 +165,8 @@ def recent_uploads(documents: list[sqlite3.Row]) -> str:
     if not documents:
         return ""
     rows = "".join(
-        f"<tr><td class='store-name'>{h(doc['store_name'])}</td><td><span class='month-tag'>{h(doc['competence'][5:7] + '/' + doc['competence'][:4])}</span></td>"
+        f"<tr><td class='store-name'>{h(doc['store_name'])}</td><td><span class='month-tag'>{h(doc['competence'][5:7] + '/' + doc['competence'][:4])}</span>"
+        f"{f'<small class=muted> {h(period_note(doc))}</small>' if period_note(doc) else ''}</td>"
         f"<td class='file-name' title='{h(doc['original_name'])}'>{h(doc['original_name'])}</td><td class='muted'>{h(datetime.fromisoformat(doc['uploaded_at']).strftime('%d/%m/%Y'))}</td>"
         f"<td class='cell-action'><a class='btn btn-ghost btn-sm' href='/download/{h(doc['id'])}' aria-label='Baixar {h(doc['original_name'])}'>{icon('download')}<span>Baixar</span></a></td></tr>"
         for doc in documents)

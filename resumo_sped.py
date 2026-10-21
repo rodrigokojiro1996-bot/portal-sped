@@ -14,7 +14,8 @@ from collections import defaultdict
 from datetime import date, timedelta
 from pathlib import Path
 
-SUMMARY_VERSION = 1
+# 2: apurações (E110, M200/M600) de vários períodos são somadas em vez de valer só a última.
+SUMMARY_VERSION = 2
 CANCELLED_STATUS = {"02", "03", "04", "05"}
 MONTHS = ("janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro")
 
@@ -84,7 +85,11 @@ def icms_tax_group(cst: str) -> str:
 
 
 def summarize(path: Path, document_type: str) -> dict:
-    lines = read_lines(path)
+    return summarize_lines(read_lines(path), document_type)
+
+
+def summarize_lines(lines: list[str], document_type: str) -> dict:
+    """Resumo de um arquivo, ou de vários arquivos parciais do mesmo mês com as linhas concatenadas em ordem de período."""
     return summarize_contributions(lines) if document_type == "contribuicoes" else summarize_fiscal(lines)
 
 
@@ -142,13 +147,14 @@ def summarize_fiscal(lines: list[str]) -> dict:
             else:
                 suppliers[current["participant"]] += value
         elif record == "E110" and len(fields) > 14:
-            assessment = {
+            period = {
                 "debitos": number(fields[2]), "ajustes_debito": number(fields[3]) + number(fields[4]),
                 "estornos_credito": number(fields[5]), "creditos": number(fields[6]),
                 "ajustes_credito": number(fields[7]) + number(fields[8]), "estornos_debito": number(fields[9]),
                 "saldo_credor_anterior": number(fields[10]), "saldo_apurado": number(fields[11]),
                 "deducoes": number(fields[12]), "recolher": number(fields[13]), "saldo_credor": number(fields[14]),
             }
+            assessment = add_period(assessment, period, first_only=("saldo_credor_anterior",), last_only=("saldo_credor",))
         elif record == "E210" and len(fields) > 13:
             st_due = (st_due or 0.0) + number(fields[13])
         elif record == "E116" and len(fields) > 4:
@@ -224,9 +230,9 @@ def summarize_contributions(lines: list[str]) -> dict:
         elif record == "C175" and current_side == "saidas" and len(fields) > 4:
             cfops[fields[2]] += number(fields[3]) - number(fields[4])
         elif record == "M200" and len(fields) > 13:
-            taxes["pis"] = tax(fields)
+            taxes["pis"] = add_period(taxes["pis"], tax(fields))
         elif record == "M600" and len(fields) > 13:
-            taxes["cofins"] = tax(fields)
+            taxes["cofins"] = add_period(taxes["cofins"], tax(fields))
         elif record == "M210" and len(fields) > 3:
             revenue_taxed += number(fields[3])
         elif record == "M400" and len(fields) > 3:
@@ -253,6 +259,16 @@ def summarize_contributions(lines: list[str]) -> dict:
             "creditos_descontados": credits,
         }
     return {"tipo": "contribuicoes", "versao": SUMMARY_VERSION, "operacoes": operations, "apuracao": assessment}
+
+
+def add_period(total: dict | None, period: dict, first_only: tuple[str, ...] = (), last_only: tuple[str, ...] = ()) -> dict:
+    """Soma os valores de uma apuração (E110, M200, M600) aos dos períodos anteriores do mesmo arquivo ou mês.
+
+    Saldos de transporte não se somam: o saldo anterior é o do primeiro período e o saldo a transportar, o do último.
+    """
+    if total is None:
+        return dict(period)
+    return {key: total[key] if key in first_only else value if key in last_only else round(total[key] + value, 2) for key, value in period.items()}
 
 
 def merge(summaries: list[dict]) -> dict | None:

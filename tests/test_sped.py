@@ -26,9 +26,34 @@ class SpedHeaderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "CNPJ inválido"):
             sped.parse_sped_header(self.header(cnpj="11222333000182"))
 
-    def test_rejects_partial_month(self):
-        with self.assertRaisesRegex(ValueError, "mês-calendário completo"):
-            sped.parse_sped_header(self.header(start="02092026"))
+    def test_accepts_period_shorter_than_a_month_with_its_competence(self):
+        cases = {  # período do 0000 -> (competência, parcial?)
+            ("01092026", "15092026"): ("2026-09", True),    # 1ª quinzena
+            ("16092026", "30092026"): ("2026-09", True),    # 2ª quinzena
+            ("15092026", "30092026"): ("2026-09", True),    # do dia 15 ao fim
+            ("10022026", "10022026"): ("2026-02", True),    # um dia só
+            ("01022026", "28022026"): ("2026-02", False),   # mês inteiro
+        }
+        for (start, end), (competence, partial) in cases.items():
+            with self.subTest(period=f"{start}-{end}"):
+                parsed = sped.parse_sped_header(self.header(start=start, end=end))
+                self.assertEqual((parsed["competence"], parsed["partial"]), (competence, partial))
+                self.assertEqual(parsed["period_start"], f"{start[4:]}-{start[2:4]}-{start[:2]}")
+                self.assertEqual(parsed["period_end"], f"{end[4:]}-{end[2:4]}-{end[:2]}")
+
+    def test_contributions_also_accept_partial_period(self):
+        content = b"|0000|006|0|0||01092026|15092026|FARMACIA EXEMPLO LTDA|11222333000181||RS|4314902||00|\r\n"
+        parsed = sped.parse_sped_header(content, "contribuicoes")
+        self.assertEqual((parsed["competence"], parsed["partial"], parsed["period_end"]), ("2026-09", True, "2026-09-15"))
+
+    def test_rejects_end_before_start(self):
+        with self.assertRaisesRegex(ValueError, "anterior à data inicial"):
+            sped.parse_sped_header(self.header(start="16092026", end="15092026"))
+
+    def test_period_label_only_for_partial_periods(self):
+        self.assertEqual(sped.period_label("2026-09-01", "2026-09-15"), "01/09/2026 a 15/09/2026")
+        self.assertEqual(sped.period_label("2026-09-01", "2026-09-30"), "")
+        self.assertEqual(sped.period_label(None, None), "")
 
     def test_rejects_period_spanning_two_months(self):
         with self.assertRaisesRegex(ValueError, "único mês"):
@@ -86,6 +111,16 @@ class SpedSummaryTests(unittest.TestCase):
         self.assertEqual(summary["apuracao"]["receita_sem_incidencia"], {"04": 300})
         self.assertEqual(summary["apuracao"]["pis"]["recolher"], 0.65)
         self.assertEqual(summary["apuracao"]["cofins"]["recolher"], 3)
+
+    def test_assessments_of_several_periods_are_added_up(self):
+        two_periods = FISCAL_SAMPLE.splitlines() + ["|E110|10|0|0|0|4|0|0|0|0|6|0|6|2|0|"]
+        icms = resumo_sped.summarize_fiscal(two_periods)["apuracao"]["icms"]
+        self.assertAlmostEqual(icms["debitos"], 18.5)
+        self.assertAlmostEqual(icms["recolher"], 11.1)
+        self.assertEqual(icms["saldo_credor_anterior"], 0)    # do primeiro período
+        self.assertEqual(icms["saldo_credor"], 2)             # do último período
+        contributions = resumo_sped.summarize_contributions(CONTRIBUTIONS_SAMPLE.splitlines() + ["|M200|0|0|0|0|0|0|0|1|0|0|1|1|"])
+        self.assertAlmostEqual(contributions["apuracao"]["pis"]["recolher"], 1.65)
 
     def test_merge_keeps_main_file_when_complement_only_has_inventory(self):
         main = resumo_sped.summarize_fiscal(FISCAL_SAMPLE.splitlines())

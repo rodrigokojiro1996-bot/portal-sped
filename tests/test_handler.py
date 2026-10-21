@@ -42,7 +42,7 @@ class SupportAccessTests(unittest.TestCase):
             for user_id, token in ((ids["Suporte Exemplo"], "support-session"), (ids["Admin Exemplo"], "admin-session"), (ids["Loja Exemplo A"], "store-session")):
                 db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (auth.token_hash(token), user_id, "csrf-" + token, int(time.time()) + 3600))
             content = b"conteudo do sped da loja b"
-            db.execute("INSERT INTO documents VALUES ('doc-b', ?, 'fiscal', '2026-09', 'sped-loja-b.txt', ?, ?, ?)", (self.store_b, len(content), hashlib.sha256(content).hexdigest(), "2026-10-12T00:00:00+00:00"))
+            db.execute("INSERT INTO documents (id, store_id, document_type, competence, original_name, size, sha256, uploaded_at) VALUES ('doc-b', ?, 'fiscal', '2026-09', 'sped-loja-b.txt', ?, ?, ?)", (self.store_b, len(content), hashlib.sha256(content).hexdigest(), "2026-10-12T00:00:00+00:00"))
         (storage.DOCUMENTS / "doc-b.txt").write_bytes(content)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), PortalHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -267,7 +267,7 @@ class DashboardSummaryTests(unittest.TestCase):
                 with storage.connect() as db:
                     store_id = db.execute("SELECT id FROM users").fetchone()["id"]
                     db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (auth.token_hash("summary-session"), store_id, "csrf", int(time.time()) + 3600))
-                    db.execute("INSERT INTO documents VALUES (?, ?, 'fiscal', '2026-09', 'sped.txt', ?, ?, ?)", ("doc-1", store_id, len(content), hashlib.sha256(content).hexdigest(), "2026-10-12T00:00:00+00:00"))
+                    db.execute("INSERT INTO documents (id, store_id, document_type, competence, original_name, size, sha256, uploaded_at) VALUES (?, ?, 'fiscal', '2026-09', 'sped.txt', ?, ?, ?)", ("doc-1", store_id, len(content), hashlib.sha256(content).hexdigest(), "2026-10-12T00:00:00+00:00"))
                 (storage.DOCUMENTS / "doc-1.txt").write_bytes(content)
                 server = ThreadingHTTPServer(("127.0.0.1", 0), PortalHandler)
                 thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -361,6 +361,17 @@ class AutoPublishTests(unittest.TestCase):
         self.assertIn(f"store_id={self.store_b}&type=contribuicoes&competence=2026-09", url)
         self.assertIn("O arquivo SPED Contribuições (PIS e COFINS) foi publicado com sucesso na loja Farmácia Bairro, CNPJ 11.444.777/0001-61, competência Setembro/2026.", page)
         self.assertIn(f"class='sped-tab active' aria-current='page' href='/dashboard?store_id={self.store_b}&amp;type=contribuicoes'", page)
+
+    def test_publishing_a_fortnight_shows_its_period_in_popup_and_file_list(self):
+        status, url, page = self.post_file(sped(FISCAL_SAMPLE, period="01092026|15092026"), "ipi-1a-quinzena.txt")
+        self.assertEqual(status, 200)
+        self.assertIn("&type=fiscal&competence=2026-09&published=", url)
+        self.assertIn("competência Setembro/2026 (período parcial de 01/09/2026 a 15/09/2026).", page)
+        self.assertIn("<dt>Período</dt><dd>01/09/2026 a 15/09/2026 (parcial)</dd>", page)
+        self.assertIn("Período 01/09/2026 a 15/09/2026 · Publicado em", page)
+        _, _, page = self.post_file(sped(FISCAL_SAMPLE, period="16092026|30092026"), "ipi-2a-quinzena.txt")
+        self.assertIn("Período 16/09/2026 a 30/09/2026 · Publicado em", page)
+        self.assertIn("2 arquivos", page)
 
     def test_refused_file_shows_error_popup_and_saves_nothing(self):
         status, _, page = self.post_file(sped(FISCAL_SAMPLE, UNREGISTERED_CNPJ))

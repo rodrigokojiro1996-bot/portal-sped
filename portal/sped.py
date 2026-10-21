@@ -68,7 +68,12 @@ def detect_sped_type(content: bytes) -> str:
     raise ValueError("O arquivo não foi reconhecido como SPED Fiscal (ICMS/IPI) nem como SPED Contribuições (PIS/COFINS).")
 
 
-def parse_sped_header(content: bytes, document_type: str = "fiscal") -> dict[str, str]:
+def parse_sped_header(content: bytes, document_type: str = "fiscal") -> dict[str, str | bool]:
+    """CNPJ, razão social, período e competência do registro 0000.
+
+    O período pode ser o mês inteiro ou só parte dele (ex.: SPED Fiscal quinzenal, de 01 a 15 e de 16 ao fim
+    do mês). A competência é sempre o mês do período; períodos que atravessam dois meses são recusados.
+    """
     if document_type not in SPED_LAYOUTS:
         raise ValueError("Tipo de SPED não reconhecido.")
     date_start_index, date_end_index, name_index, cnpj_index = SPED_LAYOUTS[document_type]
@@ -84,13 +89,25 @@ def parse_sped_header(content: bytes, document_type: str = "fiscal") -> dict[str
                 end = datetime.strptime(fields[date_end_index], "%d%m%Y").date()
             except ValueError as error:
                 raise ValueError("As datas do registro 0000 não são válidas.") from error
-            if start > end or start.year != end.year or start.month != end.month:
+            if start > end:
+                raise ValueError("A data final do registro 0000 é anterior à data inicial.")
+            if start.year != end.year or start.month != end.month:
                 raise ValueError("O período informado no registro 0000 não corresponde a um único mês.")
-            last_day = (date_after_month(start) - timedelta(days=1)).day
-            if start.day != 1 or end.day != last_day:
-                raise ValueError("O SPED não cobre o mês-calendário completo.")
-            return {"cnpj": cnpj, "competence": start.strftime("%Y-%m"), "company": fields[name_index].strip()}
+            return {"cnpj": cnpj, "competence": start.strftime("%Y-%m"), "company": fields[name_index].strip(),
+                    "period_start": start.isoformat(), "period_end": end.isoformat(), "partial": not is_full_month(start, end)}
     raise ValueError("Não foi encontrado um registro 0000 válido no início do arquivo.")
+
+
+def is_full_month(start: date, end: date) -> bool:
+    return start.day == 1 and end == date_after_month(start) - timedelta(days=1)
+
+
+def period_label(period_start: str | None, period_end: str | None) -> str:
+    """"01/09/2026 a 15/09/2026" para períodos parciais; vazio para o mês inteiro (ou arquivo sem período gravado)."""
+    if not period_start or not period_end:
+        return ""
+    start, end = date.fromisoformat(period_start), date.fromisoformat(period_end)
+    return "" if is_full_month(start, end) else f"{start:%d/%m/%Y} a {end:%d/%m/%Y}"
 
 
 def date_after_month(day: date) -> date:
