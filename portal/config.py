@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PORTAL_VERSION = "1.5.0"
+PORTAL_VERSION = "1.6.0"
 
 
 def load_env_file(path: Path) -> None:

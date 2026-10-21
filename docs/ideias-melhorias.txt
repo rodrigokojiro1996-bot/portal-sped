@@ -4,7 +4,10 @@ Anotacoes de 2026-10-20, a partir da versao 1.5.0 (branch publicacao-automatica-
 commit 2a849ae). Base de comparacao: a estrutura do Nossa Rede (Next.js), adaptando
 os principios ao portal, que e Python puro.
 
-Nada aqui foi implementado ainda. Cada item diz o que fazer, por que e como conferir.
+Cada item diz o que fazer, por que e como conferir.
+
+SITUACAO EM 2026-10-20: executado na versao 1.6.0 (branch melhorias-1.6), exceto o que esta
+marcado como pendente na lista do fim. Detalhes em docs/versao-1.6.md.
 
 
 -------------------------------------------------------------
@@ -211,20 +214,22 @@ Como:
 -------------------------------------------------------------
 ORDEM SUGERIDA DE TRABALHO
 -------------------------------------------------------------
-  [ ] 6  tag v1.5.0 e merge em main (rapido, antes de mexer em estrutura)
-  [ ] 1a calendario.py + test_calendario.py
-  [ ] 1b sped.py + test_sped.py
-  [ ] 1c auth.py + test_auth.py
-  [ ] 1d auditoria.py
-  [ ] 1e config.py + db.py
-  [ ] 2  migracoes numeradas (depende do db.py)
-  [ ] 4  /saude + checagem no boot + iniciar-portal.bat
-  [ ] 1f views/
-  [ ] 1g handler.py
-  [ ] 5  backup agendado
-  [ ] 7  scripts/windows/ e aviso das credenciais
-  [ ] 8  ideias menores
-  [ ] versao 1.6.0: CHANGELOG + docs/versao-1.6.md + tag
+  [x] 6  tag v1.5.0 e merge em main (feito antes de mexer em estrutura)
+  [x] 1a calendario.py + test_calendario.py
+  [x] 1b sped.py + test_sped.py
+  [x] 1c auth.py + test_auth.py
+  [x] 1d auditoria.py
+  [x] 1e config.py + db.py (feitos antes do 1c: todos os outros modulos dependem deles)
+  [x] 2  migracoes numeradas (001 a 004; banco real testado numa copia antes)
+  [x] 4  /saude + checagem no boot + iniciar-portal.bat
+  [x] 1f views/
+  [x] 1g handler.py (+ cli.py e publicacao.py, que o plano nao listava)
+  [x] 5  backup agendado (python app.py backup + tarefa diaria as 3h)
+  [x] 7  scripts/windows/ e aviso das credenciais
+  [~] 8  ideias menores: .env.example e rotacao do log feitos;
+         PENDENTE: templates com string.Template e HTTPS/revisao de seguranca
+  [x] versao 1.6.0: CHANGELOG + docs/versao-1.6.md  (PENDENTE: merge em main e tag v1.6.0)
+  [ ] 6  tornar o repositorio privado no GitHub (configuracao do GitHub, nao do codigo)
 
 Regra para todos os passos: rodar
   python -m unittest discover -s tests -v

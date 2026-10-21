@@ -174,8 +174,8 @@ class MonitoringDisabledTests(unittest.TestCase):
         self.assertEqual(self.log(), [])
 
     def test_footer_shows_portal_version(self):
-        self.assertEqual(config.PORTAL_VERSION, "1.5.0")
-        self.assertIn("V1.5.0", self.request("admin-session", "/dashboard")[1].decode())
+        self.assertEqual(config.PORTAL_VERSION, "1.6.0")
+        self.assertIn("V1.6.0", self.request("admin-session", "/dashboard")[1].decode())
 
 
 class BranchAccessTests(unittest.TestCase):

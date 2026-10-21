@@ -1,6 +1,38 @@
 # Changelog
 
-Mudanças do Portal Fiscal por versão. Detalhes técnicos da 1.5 em [docs/versao-1.5.md](docs/versao-1.5.md).
+Mudanças do Portal Fiscal por versão. Detalhes técnicos em [docs/versao-1.6.md](docs/versao-1.6.md) e [docs/versao-1.5.md](docs/versao-1.5.md).
+
+## 1.6.0 — 2026-10-20
+
+### Adicionado
+- **SPED de parte do mês (ex.: Fiscal quinzenal).** O registro `0000` pode trazer qualquer período dentro de um único mês: 1ª quinzena, 2ª quinzena, do dia 15 ao fim etc. A competência é o mês do período.
+  - O pop-up e a lista de arquivos mostram o período quando ele é parcial.
+  - O resumo do mês soma os arquivos parciais. O reenvio corrigido de uma quinzena substitui o anterior, sem somar duas vezes.
+- **Migrações numeradas do banco** (`migrations/NNN_nome.sql` e a tabela `schema_version`). Cada migração roda numa transação e é desfeita inteira se falhar. Bancos anteriores são reconhecidos na primeira abertura.
+- **Rota `/saude`**, sem login: responde 200 com versão e migração, ou 503.
+- **Checagem na inicialização:** configuração, pasta de dados gravável, segredo e migração esperada. Se algo falhar, o portal sai com código 2 e mostra o motivo.
+- **Backup** (`python app.py backup`, `scripts\windows\backup.bat`):
+  - copia o banco pela API do SQLite, os documentos e o `.secret`;
+  - confere a cópia antes de concluir e apaga backups com mais de 14 dias;
+  - o destino fica fora de `data/`;
+  - pode ser agendado todo dia às 3h (`instalar-backup.bat`).
+- `.env` opcional na raiz, com o modelo documentado em `.env.example`.
+- Migração `003`: índice em `documents(uploaded_at)`, para a lista de últimas publicações não ler a tabela inteira.
+
+### Alterado
+- O `app.py` (1.380 linhas) foi dividido no pacote `portal/`: `config`, `db`, `auth`, `sped`, `publicacao`, `calendario`, `auditoria`, `backup`, `views/`, `handler` e `cli`. `python app.py` e os `.bat` continuam funcionando igual.
+- Os testes foram separados em um arquivo por módulo (`tests/test_*.py`), com ajudantes comuns em `tests/util.py`. A suíte passou de 54 para 88 testes.
+- Os scripts do Windows foram para `scripts/windows/`; só o `iniciar-portal.bat` fica na raiz.
+- `iniciar-portal.bat`:
+  - detecta o portal pela `/saude`, não mais só pela porta;
+  - para em vez de reiniciar sem fim quando o problema é de configuração;
+  - gira o log acima de 5 MB.
+- Os `.bat` procuram o Python em `PORTAL_PYTHON`, no `.venv`, no PATH e no `py`. As tarefas do Windows, que rodam como SYSTEM, recebem o caminho do Python ao serem instaladas.
+- Resumo fiscal (`SUMMARY_VERSION` 2): apurações de vários períodos no mesmo arquivo ou mês (E110, M200/M600) são somadas, em vez de valer só a última.
+- `criar-usuario-suporte.bat` avisa que o `admin-credentials.txt` deve ser apagado depois que a senha for entregue.
+
+### Corrigido
+- Um teste do armazenamento deixava os caminhos apontando para uma pasta temporária já apagada.
 
 ## 1.5.0 — 2026-10-19
 
