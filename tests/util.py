@@ -4,16 +4,14 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import app
+from portal import config, db
 
 STORE_A_CNPJ, STORE_B_CNPJ, UNREGISTERED_CNPJ = "11222333000181", "11444777000161", "45543915000181"
 
 
 def restore_storage():
     """Volta os caminhos do portal para data/ sem abrir nem alterar o banco real."""
-    app.DATA_DIR = app.ROOT / "data"
-    app.DATABASE = app.DATA_DIR / "portal.sqlite3"
-    app.DOCUMENTS = app.DATA_DIR / "documentos"
-    app.APP_SECRET = None
+    db.use_paths(config.DATA_DIR)
 
 
 class TestServer:

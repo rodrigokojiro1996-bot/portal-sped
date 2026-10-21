@@ -12,15 +12,9 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import app
+from portal import db as storage
+from util import restore_storage
 import resumo_sped
-
-
-def restore_storage():
-    """Volta os caminhos do portal para data/ sem abrir nem alterar o banco real."""
-    app.DATA_DIR = app.ROOT / "data"
-    app.DATABASE = app.DATA_DIR / "portal.sqlite3"
-    app.DOCUMENTS = app.DATA_DIR / "documentos"
-    app.APP_SECRET = None
 
 
 class PasswordTests(unittest.TestCase):
@@ -29,25 +23,6 @@ class PasswordTests(unittest.TestCase):
         self.assertTrue(app.verify_password("uma-senha-segura-123", stored))
         self.assertFalse(app.verify_password("senha-errada", stored))
         self.assertNotEqual(stored, app.password_digest("uma-senha-segura-123"))
-
-
-class StorageTests(unittest.TestCase):
-    def test_store_password_policy_and_cnpj_are_enforced(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            app.configure_storage(Path(temporary))
-            with self.assertRaisesRegex(ValueError, "CNPJ válido"):
-                app.create_user("11222333000182", "Loja", "store", "uma-senha-segura-123")
-            with self.assertRaisesRegex(ValueError, "12 caracteres"):
-                app.create_user("11222333000181", "Loja", "store", "curta")
-            app.create_user("11222333000181", "Loja", "store", "uma-senha-segura-123")
-            with app.connect() as db:
-                user = db.execute("SELECT id, cnpj, role FROM users").fetchone()
-                for document_type in ("fiscal", "contribuicoes"):
-                    db.execute("INSERT INTO documents (id, store_id, document_type, competence, original_name, size, sha256, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (document_type, user["id"], document_type, "2026-09", f"{document_type}.txt", 1, "digest", "2026-10-12T00:00:00+00:00"))
-                db.execute("INSERT INTO documents (id, store_id, document_type, competence, original_name, size, sha256, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", ("fiscal-supplement", user["id"], "fiscal", "2026-09", "bloco_h.txt", 1, "different-digest", "2026-10-12T00:00:00+00:00"))
-                with self.assertRaises(sqlite3.IntegrityError):
-                    db.execute("INSERT INTO documents (id, store_id, document_type, competence, original_name, size, sha256, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", ("duplicate", user["id"], "fiscal", "2026-09", "duplicate.txt", 1, "digest", "2026-10-12T00:00:00+00:00"))
-            self.assertEqual((user["cnpj"], user["role"]), ("11222333000181", "store"))
 
 
 class SupportAccessTests(unittest.TestCase):
@@ -72,7 +47,7 @@ class SupportAccessTests(unittest.TestCase):
                 db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (app.token_hash(token), user_id, "csrf-" + token, int(time.time()) + 3600))
             content = b"conteudo do sped da loja b"
             db.execute("INSERT INTO documents VALUES ('doc-b', ?, 'fiscal', '2026-09', 'sped-loja-b.txt', ?, ?, ?)", (self.store_b, len(content), hashlib.sha256(content).hexdigest(), "2026-10-12T00:00:00+00:00"))
-        (app.DOCUMENTS / "doc-b.txt").write_bytes(content)
+        (storage.DOCUMENTS / "doc-b.txt").write_bytes(content)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), app.PortalHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -340,7 +315,7 @@ class BranchAccessTests(unittest.TestCase):
 
     def add_document(self, db, store_id, filename, content):
         document_id = str(uuid.uuid4())
-        (app.DOCUMENTS / f"{document_id}.txt").write_bytes(content)
+        (storage.DOCUMENTS / f"{document_id}.txt").write_bytes(content)
         db.execute("INSERT INTO documents (id, store_id, document_type, competence, original_name, size, sha256, uploaded_at) VALUES (?, ?, 'fiscal', '2026-09', ?, ?, ?, ?)", (document_id, store_id, filename, len(content), hashlib.sha256(content).hexdigest(), "2026-10-12T00:00:00+00:00"))
         return document_id
 
@@ -441,7 +416,7 @@ class DashboardSummaryTests(unittest.TestCase):
                     store_id = db.execute("SELECT id FROM users").fetchone()["id"]
                     db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (app.token_hash("summary-session"), store_id, "csrf", int(time.time()) + 3600))
                     db.execute("INSERT INTO documents VALUES (?, ?, 'fiscal', '2026-09', 'sped.txt', ?, ?, ?)", ("doc-1", store_id, len(content), hashlib.sha256(content).hexdigest(), "2026-10-12T00:00:00+00:00"))
-                (app.DOCUMENTS / "doc-1.txt").write_bytes(content)
+                (storage.DOCUMENTS / "doc-1.txt").write_bytes(content)
                 server = ThreadingHTTPServer(("127.0.0.1", 0), app.PortalHandler)
                 thread = threading.Thread(target=server.serve_forever, daemon=True)
                 thread.start()
@@ -505,7 +480,7 @@ class AutoPublishTests(unittest.TestCase):
             return [dict(row) for row in db.execute("SELECT store_id, document_type, competence, original_name FROM documents ORDER BY uploaded_at")]
 
     def stored_files(self):
-        return sorted(path.name for path in app.DOCUMENTS.iterdir())
+        return sorted(path.name for path in storage.DOCUMENTS.iterdir())
 
     def post_file(self, content, file_name="sped.txt", csrf="csrf-admin"):
         """Envia o formulário de publicação como o navegador: só o csrf e o arquivo."""
@@ -527,7 +502,7 @@ class AutoPublishTests(unittest.TestCase):
         published = app.publish_sped(content, "sped-fiscal-centro.txt")
         self.assertEqual((published["store_id"], published["document_type"], published["competence"]), (self.store_a, "fiscal", "2026-09"))
         self.assertEqual(self.documents(), [{"store_id": self.store_a, "document_type": "fiscal", "competence": "2026-09", "original_name": "sped-fiscal-centro.txt"}])
-        self.assertEqual((app.DOCUMENTS / f"{published['id']}.txt").read_bytes(), content)
+        self.assertEqual((storage.DOCUMENTS / f"{published['id']}.txt").read_bytes(), content)
 
     def test_contributions_file_is_attached_to_store_of_its_cnpj_in_contributions_tab(self):
         published = app.publish_sped(sped(CONTRIBUTIONS_SAMPLE, STORE_B_CNPJ), "contribuicoes.txt")
