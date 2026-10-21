@@ -24,6 +24,7 @@ from typing import Iterator
 from urllib.parse import parse_qs, urlparse
 
 import resumo_sped
+from portal.sped import DOCUMENT_TYPES, SPED_LAYOUTS, PublishError, detect_sped_type, format_cnpj, normalize_cnpj, parse_sped_header, sped_label, valid_cnpj
 from portal.calendario import (LARGE_GROUP_BUSINESS_DAY, LARGE_GROUP_NOTE, SMALL_GROUP_BUSINESS_DAY, SMALL_GROUP_UNITS, business_day, competence_timeline, easter,
                                next_competence, non_business_days, publication_deadline)
 
@@ -226,50 +227,6 @@ def initialize_database() -> None:
         db.execute("CREATE INDEX IF NOT EXISTS audit_log_created ON audit_log(created_at)")
 
 
-def normalize_cnpj(value: str) -> str:
-    return re.sub(r"\D", "", value)
-
-
-def valid_cnpj(value: str) -> bool:
-    digits = normalize_cnpj(value)
-    if len(digits) != 14 or digits == digits[0] * 14:
-        return False
-    for length, weights in ((12, (5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2)),
-                            (13, (6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2))):
-        remainder = sum(int(digit) * weight for digit, weight in zip(digits[:length], weights)) % 11
-        check_digit = 0 if remainder < 2 else 11 - remainder
-        if int(digits[length]) != check_digit:
-            return False
-    return True
-
-
-# Posições de DT_INI, DT_FIN, NOME e CNPJ no registro 0000 de cada leiaute. O Contribuições traz
-# TIPO_ESCRIT, IND_SIT_ESP e NUM_REC_ANTERIOR antes do período, por isso tudo anda duas casas.
-SPED_LAYOUTS = {"fiscal": (4, 5, 6, 7), "contribuicoes": (6, 7, 8, 9)}
-
-
-def detect_sped_type(content: bytes) -> str:
-    """Identifica pelo registro 0000 se o arquivo é SPED Fiscal (ICMS/IPI) ou SPED Contribuições (PIS/COFINS).
-
-    Só um dos leiautes tem datas DDMMAAAA e CNPJ de 14 dígitos nas posições esperadas: no Fiscal, o campo 4
-    é a data inicial; no Contribuições, é o indicador de situação especial (vazio ou um dígito).
-    """
-    text = content.decode("utf-8-sig", errors="replace")
-    for line in text.splitlines()[:500]:
-        fields = line.strip().split("|")
-        if len(fields) > 2 and fields[1] == "0000":
-            matches = [kind for kind, (start, end, _name, cnpj) in SPED_LAYOUTS.items()
-                       if len(fields) > cnpj and re.fullmatch(r"\d{8}", fields[start]) and re.fullmatch(r"\d{8}", fields[end]) and re.fullmatch(r"\d{14}", fields[cnpj])]
-            if len(matches) == 1:
-                return matches[0]
-            break
-    raise ValueError("O arquivo não foi reconhecido como SPED Fiscal (ICMS/IPI) nem como SPED Contribuições (PIS/COFINS).")
-
-
-class PublishError(ValueError):
-    """Arquivo recusado na publicação, com a explicação mostrada à administração."""
-
-
 def publish_sped(content: bytes, file_name: str) -> dict[str, str | int]:
     """Publicação automática: o tipo, a loja (pelo CNPJ) e a competência vêm do registro 0000 do próprio arquivo."""
     if not content:
@@ -305,30 +262,6 @@ def publish_sped(content: bytes, file_name: str) -> dict[str, str | int]:
         document = db.execute("SELECT * FROM documents WHERE id=?", (doc_id,)).fetchone()
     document_summary(document)
     return {"id": doc_id, "store_id": store["id"], "store_name": store["name"], "cnpj": store["cnpj"], "document_type": document_type, "competence": header["competence"]}
-
-
-def parse_sped_header(content: bytes, document_type: str = "fiscal") -> dict[str, str]:
-    if document_type not in SPED_LAYOUTS:
-        raise ValueError("Tipo de SPED não reconhecido.")
-    date_start_index, date_end_index, name_index, cnpj_index = SPED_LAYOUTS[document_type]
-    text = content.decode("utf-8-sig", errors="replace")
-    for line in text.splitlines()[:500]:
-        fields = line.strip().split("|")
-        if len(fields) > cnpj_index and fields[1] == "0000":
-            cnpj = normalize_cnpj(fields[cnpj_index])
-            if not valid_cnpj(cnpj):
-                raise ValueError("O registro 0000 contém um CNPJ inválido.")
-            try:
-                start = datetime.strptime(fields[date_start_index], "%d%m%Y").date()
-                end = datetime.strptime(fields[date_end_index], "%d%m%Y").date()
-            except ValueError as error:
-                raise ValueError("As datas do registro 0000 não são válidas.") from error
-            if start > end or start.year != end.year or start.month != end.month:
-                raise ValueError("O período informado no registro 0000 não corresponde a um único mês.")
-            if start.day != 1 or end.day != (date(start.year + (start.month == 12), start.month % 12 + 1, 1) - timedelta(days=1)).day:
-                raise ValueError("O SPED não cobre o mês-calendário completo.")
-            return {"cnpj": cnpj, "competence": start.strftime("%Y-%m"), "company": fields[name_index].strip()}
-    raise ValueError("Não foi encontrado um registro 0000 válido no início do arquivo.")
 
 
 def password_digest(password: str) -> str:
@@ -533,19 +466,6 @@ def h(value: object) -> str:
     return html.escape(str(value), quote=True)
 
 
-# Tipos de SPED: rótulo, o que o arquivo apura e a letra do ícone da aba.
-DOCUMENT_TYPES = {
-    "fiscal": ("SPED Fiscal", "ICMS e IPI", "F"),
-    "contribuicoes": ("SPED Contribuições", "PIS e COFINS", "C"),
-}
-
-
-def sped_label(document_type: str) -> str:
-    """Nome completo do tipo, como aparece nas mensagens: "SPED Fiscal (ICMS e IPI)"."""
-    label, subject, _ = DOCUMENT_TYPES[document_type]
-    return f"{label} ({subject})"
-
-
 def publish_dialog(success: bool, message: str, details: list[tuple[str, str]] | None = None) -> str:
     """Pop-up do resultado da publicação. É um <dialog> nativo que fecha pelo próprio botão, sem JavaScript."""
     title = "Arquivo publicado com sucesso" if success else "Arquivo não publicado"
@@ -573,11 +493,6 @@ ICONS = {
 
 def icon(name: str) -> str:
     return f"<svg class='icon' viewBox='0 0 24 24' aria-hidden='true' focusable='false'>{ICONS[name]}</svg>"
-
-
-def format_cnpj(value: str | None) -> str:
-    digits = normalize_cnpj(value or "")
-    return f"{digits[:2]}.{digits[2:5]}.{digits[5:8]}/{digits[8:12]}-{digits[12:]}" if len(digits) == 14 else (value or "")
 
 
 def dashboard_link(store_id: int | None = None, document_type: str = "fiscal", competence: str = "") -> str:
