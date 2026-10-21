@@ -9,4 +9,6 @@ sped-import-report.csv
 /SPEDs/
 .venv/
 .env*
+!.env.example
 /logs/
+/backups/

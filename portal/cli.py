@@ -6,6 +6,7 @@ Comandos:
     criar-suporte       cria um usuário de suporte: [usuario] [nome] [--salvar-em arquivo.txt]
     redefinir-senha     gera senha nova para uma loja (CNPJ) ou suporte (usuário)
     gerar-resumos       recalcula os resumos fiscais dos arquivos publicados
+    backup              copia banco, documentos e segredo: [--destino PASTA] [--manter DIAS]
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ from pathlib import Path
 from portal import config
 from portal import db as storage
 from portal.auth import create_support_user, create_user, reset_store_password
+from portal.backup import BackupError, run_backup
 from portal.db import configure_storage, connect
 from portal.handler import PortalHandler
 from portal.publicacao import document_summary
@@ -82,6 +84,23 @@ def rebuild_summaries() -> None:
     print(f"Resumos prontos: {len(documents) - failures} de {len(documents)} arquivos.")
 
 
+def backup(args: list[str]) -> None:
+    options = {"--destino": None, "--manter": None}
+    while args:
+        flag = args.pop(0)
+        if flag not in options or not args:
+            raise SystemExit("Uso: python app.py backup [--destino PASTA] [--manter DIAS]")
+        options[flag] = args.pop(0)
+    if options["--manter"] is not None and not options["--manter"].isdigit():
+        raise SystemExit("--manter precisa ser um número de dias.")
+    try:
+        target = run_backup(Path(options["--destino"]) if options["--destino"] else None,
+                            int(options["--manter"]) if options["--manter"] else None)
+    except (BackupError, OSError, sqlite3.Error) as error:
+        raise SystemExit(f"Backup não concluído: {error}") from error
+    print(f"Backup concluído e conferido: {target}")
+
+
 def serve() -> None:
     server = ThreadingHTTPServer((config.HOST, config.PORT), PortalHandler)
     print(f"Portal Fiscal {config.PORTAL_VERSION} ativo em http://{config.HOST}:{config.PORT} (monitoramento do suporte {'ativo' if config.MONITORING_ENABLED else 'desativado'})")
@@ -135,6 +154,8 @@ def main(argv: list[str] | None = None) -> None:
         reset_password(rest)
     elif command == "gerar-resumos":
         rebuild_summaries()
+    elif command == "backup":
+        backup(rest)
     elif command == "":
         serve()
     else:
