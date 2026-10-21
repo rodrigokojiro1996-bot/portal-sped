@@ -77,7 +77,7 @@ def temporary_storage(test):
     """Banco e documentos numa pasta temporária, desfeitos no fim do teste."""
     import tempfile
     temporary = tempfile.TemporaryDirectory()
-    app.configure_storage(Path(temporary.name))
+    db.configure_storage(Path(temporary.name))
     test.addCleanup(temporary.cleanup)
     test.addCleanup(restore_storage)
     return Path(temporary.name)
