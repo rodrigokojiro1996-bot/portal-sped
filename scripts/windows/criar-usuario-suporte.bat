@@ -2,9 +2,8 @@
 rem Cria um usuario de suporte do Portal Fiscal (ve todas as lojas, so consulta e baixa arquivos).
 rem A credencial e mostrada na tela e acrescentada em admin-credentials.txt na Area de Trabalho.
 setlocal
-cd /d "%~dp0"
-set "PYTHON=%~dp0..\.venv\Scripts\python.exe"
-if not exist "%PYTHON%" set "PYTHON=python"
+cd /d "%~dp0..\.."
+call "%~dp0python.bat"
 set "PYTHONIOENCODING=utf-8"
 chcp 65001 >nul
 echo ============================================
@@ -18,4 +17,6 @@ set /p "NOME=Nome exibido [Suporte Farmacias Associadas]: "
 echo.
 "%PYTHON%" app.py criar-suporte "%LOGIN%" "%NOME%" --salvar-em "%USERPROFILE%\Desktop\admin-credentials.txt"
 echo.
+echo ATENCAO: admin-credentials.txt guarda a senha em texto puro.
+echo Depois de entregar a senha ao usuario, apague o arquivo da Area de Trabalho.
 pause

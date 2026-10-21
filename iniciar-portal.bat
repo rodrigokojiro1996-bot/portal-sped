@@ -7,14 +7,8 @@ rem ==========================================================================
 setlocal
 cd /d "%~dp0"
 
-rem Python: ambiente virtual do projeto (pasta .venv ao lado de portal-sped), senao o "python" do PATH,
-rem senao o inicializador "py" do Windows (instalado em C:\Windows quando o PATH nao tem o Python).
-set "PYTHON=%~dp0..\.venv\Scripts\python.exe"
-if exist "%PYTHON%" goto python_ok
-set "PYTHON=python"
-where python >nul 2>&1 && goto python_ok
-set "PYTHON=py"
-:python_ok
+rem Python do portal: PORTAL_PYTHON, .venv, "python" do PATH ou "py" (veja scripts\windows\python.bat).
+call "%~dp0scripts\windows\python.bat"
 
 rem 127.0.0.1 = acesso somente neste computador.
 rem Para liberar na rede interna, troque por 0.0.0.0 (veja o README antes).

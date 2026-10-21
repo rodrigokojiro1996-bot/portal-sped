@@ -1,9 +1,8 @@
 @echo off
 rem Gera uma senha nova para uma loja do Portal Fiscal e mostra na tela.
 setlocal
-cd /d "%~dp0"
-set "PYTHON=%~dp0..\.venv\Scripts\python.exe"
-if not exist "%PYTHON%" set "PYTHON=python"
+cd /d "%~dp0..\.."
+call "%~dp0python.bat"
 set "PYTHONIOENCODING=utf-8"
 chcp 65001 >nul
 echo ============================================

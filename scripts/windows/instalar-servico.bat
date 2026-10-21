@@ -7,6 +7,6 @@ if errorlevel 1 (
     powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
     exit /b
 )
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\servico-windows.ps1" -Acao instalar
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0servico-windows.ps1" -Acao instalar
 echo.
 pause
