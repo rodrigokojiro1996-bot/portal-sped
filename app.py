@@ -24,6 +24,8 @@ from typing import Iterator
 from urllib.parse import parse_qs, urlparse
 
 import resumo_sped
+from portal import auditoria, config
+from portal.auditoria import AUDIT_ACTIONS, AUDIT_FILTERS, AUDIT_PERIODS, AUDITED_ROLES, WEEKDAYS, audit_entries, audit_sentence, browser_label, csv_cell, machine_name
 from portal.auth import (READABLE_ALPHABET, ROLE_LABELS, STAFF_ROLES, USER_ROLES, create_support_user, create_user, password_digest, readable_password,
                          reset_store_password, token_hash, verify_password)
 from portal import db as storage
@@ -34,26 +36,13 @@ from portal.calendario import (LARGE_GROUP_BUSINESS_DAY, LARGE_GROUP_NOTE, SMALL
 
 
 ROOT = Path(__file__).resolve().parent
-MAX_UPLOAD_BYTES = 40 * 1024 * 1024
-SESSION_SECONDS = 8 * 60 * 60
-LOGIN_FORM_SECONDS = 2 * 60 * 60
 
-AUDITED_ROLES = ("support",)
-
-PORTAL_VERSION = "1.5.0"
-
-# Monitoramento do suporte: DESATIVADO a partir da versão 1.5.
-# Desligado, o portal não mostra o item "Monitoramento" na lateral, responde "Página não encontrada" em
-# /monitoramento e /monitoramento.csv, não grava nada em audit_log e não avisa o suporte de que as ações são
-# registradas. O código, a tabela audit_log e o histórico já gravado continuam no lugar.
-# Para reativar: inicie o portal com a variável de ambiente PORTAL_MONITORAMENTO=1.
-MONITORING_ENABLED = os.environ.get("PORTAL_MONITORAMENTO", "0") == "1"
 
 def publish_sped(content: bytes, file_name: str) -> dict[str, str | int]:
     """Publicação automática: o tipo, a loja (pelo CNPJ) e a competência vêm do registro 0000 do próprio arquivo."""
     if not content:
         raise PublishError("Escolha um arquivo .txt para publicar.")
-    if len(content) > MAX_UPLOAD_BYTES:
+    if len(content) > config.MAX_UPLOAD_BYTES:
         raise PublishError("O arquivo passa do limite de 40 MB.")
     try:
         document_type = detect_sped_type(content)
@@ -87,96 +76,6 @@ def publish_sped(content: bytes, file_name: str) -> dict[str, str | int]:
 
 
 # --------------------------------------------------------------------------- monitoramento do suporte
-
-AUDIT_ACTIONS = {
-    # ação: (rótulo curto do selo, categoria do filtro)
-    "login": ("Acesso", "acessos"),
-    "logout": ("Acesso", "acessos"),
-    "login_falhou": ("Alerta", "alertas"),
-    "abriu_central": ("Consulta", "consultas"),
-    "abriu_loja": ("Consulta", "consultas"),
-    "baixou_arquivo": ("Download", "downloads"),
-    "acao_bloqueada": ("Alerta", "alertas"),
-}
-AUDIT_FILTERS = {"": "Todas as ações", "acessos": "Entradas e saídas", "consultas": "Lojas consultadas", "downloads": "Arquivos baixados", "alertas": "Alertas"}
-AUDIT_PERIODS = {"hoje": ("Hoje", 0), "7d": ("Últimos 7 dias", 6), "30d": ("Últimos 30 dias", 29), "tudo": ("Todo o período", None)}
-WEEKDAYS = ("segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo")
-_machine_cache: dict[str, str] = {}
-_machine_resolver = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nome-maquina")
-
-
-def machine_name(ip: str) -> str:
-    """Nome do computador de onde veio o acesso, pela rede (DNS/NetBIOS). Vazio quando a rede não informa."""
-    if ip in _machine_cache:
-        return _machine_cache[ip]
-    if ip in ("127.0.0.1", "::1"):
-        name = socket.gethostname().upper()
-    else:
-        try:
-            name = _machine_resolver.submit(socket.gethostbyaddr, ip).result(timeout=1.5)[0].split(".")[0].upper()
-        except Exception:
-            name = ""
-    _machine_cache[ip] = name
-    return name
-
-
-def browser_label(agent: str) -> str:
-    browser = ("Edge" if "Edg/" in agent else "Opera" if "OPR/" in agent else "Chrome" if "Chrome/" in agent
-               else "Firefox" if "Firefox/" in agent else "Safari" if "Safari/" in agent else "Navegador não identificado")
-    system = ("Windows" if "Windows" in agent else "Android" if "Android" in agent else "iPhone" if ("iPhone" in agent or "iPad" in agent)
-              else "macOS" if "Mac OS" in agent else "Linux" if "Linux" in agent else "")
-    return f"{browser} no {system}" if system else browser
-
-
-def audit_sentence(entry: sqlite3.Row) -> tuple[str, str]:
-    """Frase principal e complemento que descrevem uma ação registrada, em linguagem simples."""
-    type_label = DOCUMENT_TYPES.get(entry["document_type"] or "", ("", "", ""))[0]
-    month = resumo_sped.month_label(entry["competence"]).capitalize() if entry["competence"] else ""
-    context = " · ".join(part for part in (type_label, month) if part)
-    action = entry["action"]
-    if action == "login":
-        return "Entrou no portal", ""
-    if action == "logout":
-        return "Saiu do portal", ""
-    if action == "login_falhou":
-        return "Tentou entrar com a senha errada", "O acesso foi recusado"
-    if action == "abriu_central":
-        return "Abriu a lista de todas as lojas", type_label
-    if action == "abriu_loja":
-        return "Consultou a loja", context
-    if action == "baixou_arquivo":
-        return f"Baixou o arquivo {entry['file_name']}", context
-    if action == "acao_bloqueada":
-        return f"Tentou {entry['detail']}", "Bloqueado: o suporte só consulta e baixa arquivos"
-    return action, ""
-
-
-def audit_entries(user_id: str = "", period: str = "7d", category: str = "", limit: int | None = 500) -> list[sqlite3.Row]:
-    clauses, params = [], []
-    if user_id.isdigit():
-        clauses.append("user_id=?")
-        params.append(int(user_id))
-    days = AUDIT_PERIODS.get(period, AUDIT_PERIODS["7d"])[1]
-    if days is not None:
-        clauses.append("created_at >= ?")
-        params.append((date.today() - timedelta(days=days)).isoformat())
-    actions = [action for action, (_, group) in AUDIT_ACTIONS.items() if group == category]
-    if actions:
-        clauses.append(f"action IN ({','.join('?' * len(actions))})")
-        params.extend(actions)
-    sql = "SELECT * FROM audit_log" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY id DESC"
-    if limit:
-        sql += f" LIMIT {int(limit)}"
-    with connect() as db:
-        return db.execute(sql, params).fetchall()
-
-
-def csv_cell(value: object) -> str:
-    """Célula de CSV para Excel (separador ;), protegida contra fórmulas injetadas."""
-    text = "" if value is None else str(value)
-    if text[:1] in ("=", "+", "-", "@"):
-        text = "'" + text
-    return '"' + text.replace('"', '""') + '"' if any(char in text for char in ';"\n\r') else text
 
 
 def document_summary(document: sqlite3.Row) -> dict | None:
@@ -270,7 +169,7 @@ def render_page(title: str, content: str, user: sqlite3.Row | None = None) -> by
         nav = (f"<div class='user-chip'><span class='user-mark'>{h(user['name'][:1].upper())}</span><span class='user-text'>{h(user['name'])}<small>{ROLE_LABELS.get(user['role'], '')}</small></span>"
                f"<form method='post' action='/logout'><input type='hidden' name='csrf' value='{h(user['csrf_token'])}'><button class='btn btn-ghost btn-sm' type='submit'>{icon('logout')}<span>Sair</span></button></form></div>")
     brand = "<a class='brand' href='/dashboard'><img class='brand-logo' src='/static/farmacias-associadas-logo.png' alt='Farmácias Associadas'><span class='brand-context'>PORTAL FISCAL</span></a>"
-    return (f"<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='theme-color' content='#087e70'><title>{h(title)} · Portal Fiscal</title><link rel='stylesheet' href='/static/styles.css?v={STYLES_VERSION}'><script src='/static/portal.js?v={SCRIPT_VERSION}' defer></script></head><body><header class='topbar'>{brand}{nav}</header>{content}<footer class='site-footer'><span>PORTAL FISCAL <i></i> FARMÁCIAS ASSOCIADAS <i></i> V{PORTAL_VERSION}</span><span>Documentos acessíveis somente à loja autorizada.</span></footer></body></html>").encode("utf-8")
+    return (f"<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='theme-color' content='#087e70'><title>{h(title)} · Portal Fiscal</title><link rel='stylesheet' href='/static/styles.css?v={STYLES_VERSION}'><script src='/static/portal.js?v={SCRIPT_VERSION}' defer></script></head><body><header class='topbar'>{brand}{nav}</header>{content}<footer class='site-footer'><span>PORTAL FISCAL <i></i> FARMÁCIAS ASSOCIADAS <i></i> V{config.PORTAL_VERSION}</span><span>Documentos acessíveis somente à loja autorizada.</span></footer></body></html>").encode("utf-8")
 
 
 class PortalHandler(BaseHTTPRequestHandler):
@@ -292,8 +191,8 @@ class PortalHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Robots-Tag", "noindex, nofollow")
         if getattr(self, "session_cookie", None):
-            cookie = f"portal_session={self.session_cookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_SECONDS}"
-            if os.environ.get("COOKIE_SECURE") == "1":
+            cookie = f"portal_session={self.session_cookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age={config.SESSION_SECONDS}"
+            if config.COOKIE_SECURE:
                 cookie += "; Secure"
             self.send_header("Set-Cookie", cookie)
         for key, value in (headers or {}).items():
@@ -337,7 +236,7 @@ class PortalHandler(BaseHTTPRequestHandler):
                    "<label>Senha<input name='password' type='password' autocomplete='current-password' placeholder='Sua senha de acesso' required></label>"
                    "<button class='button button-primary button-wide'>Entrar no portal <span>→</span></button></form>"
                    "<div class='login-note'><span class='lock-icon'>▣</span> Conexão protegida. Seus arquivos são privados.</div></section></main>")
-        cookie = f"login_nonce={nonce}; Path=/; HttpOnly; SameSite=Strict; Max-Age={LOGIN_FORM_SECONDS}" + ("; Secure" if os.environ.get("COOKIE_SECURE") == "1" else "")
+        cookie = f"login_nonce={nonce}; Path=/; HttpOnly; SameSite=Strict; Max-Age={config.LOGIN_FORM_SECONDS}" + ("; Secure" if config.COOKIE_SECURE else "")
         self.send_bytes(status, render_page("Acesso", content), headers={"Set-Cookie": cookie})
 
     def get_user(self) -> sqlite3.Row | None:
@@ -351,7 +250,7 @@ class PortalHandler(BaseHTTPRequestHandler):
 
     def form(self) -> dict[str, str | bytes]:
         length = int(self.headers.get("Content-Length", "0"))
-        if length < 0 or length > MAX_UPLOAD_BYTES + 65536:
+        if length < 0 or length > config.MAX_UPLOAD_BYTES + 65536:
             raise ValueError("O envio excede o limite permitido de 40 MB.")
         body = self.rfile.read(length)
         content_type = self.headers.get("Content-Type", "")
@@ -417,7 +316,7 @@ class PortalHandler(BaseHTTPRequestHandler):
             self.dashboard_workspace(user)
         elif path.startswith("/download/"):
             self.download(user, path.removeprefix("/download/"))
-        elif MONITORING_ENABLED and path in ("/monitoramento", "/monitoramento.csv"):
+        elif config.MONITORING_ENABLED and path in ("/monitoramento", "/monitoramento.csv"):
             if user["role"] != "admin":
                 self.audit(user, "acao_bloqueada", detail="abrir o monitoramento do suporte")
                 self.send_page(HTTPStatus.FORBIDDEN, "Acesso negado", "<main class='content'><h1>Área restrita à administração.</h1></main>", user)
@@ -476,7 +375,7 @@ class PortalHandler(BaseHTTPRequestHandler):
         if message:
             main += f"<div class='notice' role='status'>{h(message)}</div>"
         if user["role"] == "support":
-            recorded = " As ações deste acesso são registradas." if MONITORING_ENABLED else ""
+            recorded = " As ações deste acesso são registradas." if config.MONITORING_ENABLED else ""
             main += (f"<div class='notice notice-info' role='note'>{icon('eye')}<span><strong>Acesso de suporte:</strong> consulta de todas as lojas e download de arquivos. "
                      f"Para publicar arquivos ou cadastrar lojas, fale com a administração.{recorded}</span></div>")
         if selected_store:
@@ -560,7 +459,7 @@ class PortalHandler(BaseHTTPRequestHandler):
             f"<span class='tab-mark'>{mark}</span><span class='tab-text'>{label}<small>{subject}</small></span></a>"
             for key, (label, subject, mark) in DOCUMENT_TYPES.items())
         navigation = f"<nav class='sped-navigation' aria-label='Tipo de arquivo'><span class='side-section-label'>ARQUIVOS</span>{tabs}</nav>"
-        if admin and MONITORING_ENABLED:
+        if admin and config.MONITORING_ENABLED:
             navigation += (f"<nav class='sped-navigation' aria-label='Administração'><span class='side-section-label'>ADMINISTRAÇÃO</span>"
                            f"<a class='sped-tab{current if section == 'monitoramento' else ''}' href='/monitoramento'><span class='tab-mark'>{icon('eye')}</span>"
                            "<span class='tab-text'>Monitoramento<small>Ações do suporte</small></span></a></nav>")
@@ -779,26 +678,7 @@ class PortalHandler(BaseHTTPRequestHandler):
 
     def audit(self, user: sqlite3.Row | dict | None, action: str, store: sqlite3.Row | dict | None = None, document_type: str | None = None,
               competence: str | None = None, file_name: str | None = None, detail: str | None = None) -> None:
-        """Registra uma ação de um perfil monitorado (suporte): quem, o quê, qual loja, quando e de qual máquina.
-
-        Abrir a mesma tela de novo em menos de 1 minuto (recarregar, voltar) não gera registro repetido.
-        """
-        if not MONITORING_ENABLED or not user or user["role"] not in AUDITED_ROLES:
-            return
-        now = datetime.now().astimezone()
-        store_id = store["id"] if store else None
-        with connect() as db:
-            if action in ("abriu_loja", "abriu_central"):
-                last = db.execute("SELECT action, store_id, document_type, competence, created_at FROM audit_log WHERE user_id=? ORDER BY id DESC LIMIT 1", (user["id"],)).fetchone()
-                if (last and (last["action"], last["store_id"], last["document_type"], last["competence"]) == (action, store_id, document_type, competence or None)
-                        and (now - datetime.fromisoformat(last["created_at"])).total_seconds() < 60):
-                    return
-            ip = self.client_address[0]
-            db.execute(
-                "INSERT INTO audit_log (created_at, user_id, user_name, login_name, action, store_id, store_name, store_cnpj, document_type, competence, file_name, detail, ip, machine, browser) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (now.isoformat(timespec="seconds"), user["id"], user["name"], user["login_name"], action, store_id, store["name"] if store else None,
-                 store["cnpj"] if store else None, document_type, competence or None, file_name, detail, ip, machine_name(ip), browser_label(self.headers.get("User-Agent", ""))))
+        auditoria.record(user, action, self.client_address[0], self.headers.get("User-Agent", ""), store, document_type, competence, file_name, detail)
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
@@ -862,12 +742,12 @@ class PortalHandler(BaseHTTPRequestHandler):
             raw_token = secrets.token_urlsafe(32)
             csrf = secrets.token_urlsafe(24)
             db.execute("DELETE FROM sessions WHERE user_id=?", (account["id"],))
-            db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (token_hash(raw_token), account["id"], csrf, now + SESSION_SECONDS))
+            db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (token_hash(raw_token), account["id"], csrf, now + config.SESSION_SECONDS))
         self.audit(account, "login")
         self.session_cookie = raw_token
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", "/dashboard")
-        self.send_header("Set-Cookie", f"portal_session={raw_token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_SECONDS}" + ("; Secure" if os.environ.get("COOKIE_SECURE") == "1" else ""))
+        self.send_header("Set-Cookie", f"portal_session={raw_token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={config.SESSION_SECONDS}" + ("; Secure" if config.COOKIE_SECURE else ""))
         self.send_header("Set-Cookie", "login_nonce=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
         self.end_headers()
 
@@ -931,10 +811,10 @@ def main() -> None:
             raise SystemExit(str(error)) from error
         print(f"Usuário de suporte criado: {login_name} ({name})")
         print(f"Senha: {password}")
-        print("Acesso: todas as lojas, somente consulta e download." + (" As ações ficam registradas no monitoramento da administração." if MONITORING_ENABLED else ""))
+        print("Acesso: todas as lojas, somente consulta e download." + (" As ações ficam registradas no monitoramento da administração." if config.MONITORING_ENABLED else ""))
         if target:
             block = (f"\nPORTAL FISCAL - ACESSO SUPORTE\nUsuário: {login_name}\nSenha: {password}\n"
-                     "Perfil: consulta de todas as lojas e download de arquivos. Não publica nem cadastra." + (" Ações registradas no monitoramento." if MONITORING_ENABLED else "") + "\n")
+                     "Perfil: consulta de todas as lojas e download de arquivos. Não publica nem cadastra." + (" Ações registradas no monitoramento." if config.MONITORING_ENABLED else "") + "\n")
             with open(target, "a", encoding="utf-8") as handle:
                 handle.write(block)
             print(f"Credencial adicionada em: {target}")
@@ -959,7 +839,7 @@ def main() -> None:
     host = os.environ.get("PORTAL_HOST", "127.0.0.1")
     port = int(os.environ.get("PORTAL_PORT", "8000"))
     server = ThreadingHTTPServer((host, port), PortalHandler)
-    print(f"Portal Fiscal {PORTAL_VERSION} ativo em http://{host}:{port} (monitoramento do suporte {'ativo' if MONITORING_ENABLED else 'desativado'})")
+    print(f"Portal Fiscal {config.PORTAL_VERSION} ativo em http://{host}:{port} (monitoramento do suporte {'ativo' if config.MONITORING_ENABLED else 'desativado'})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

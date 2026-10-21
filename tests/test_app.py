@@ -1,6 +1,7 @@
 import tempfile
 import sqlite3
 import hashlib
+import socket
 import threading
 import time
 import unittest
@@ -12,6 +13,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import app
+from portal import config
 from portal import db as storage
 from util import restore_storage
 import resumo_sped
@@ -24,8 +26,8 @@ class SupportAccessTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.monitoring = app.MONITORING_ENABLED
-        app.MONITORING_ENABLED = True
+        self.monitoring = config.MONITORING_ENABLED
+        config.MONITORING_ENABLED = True
         self.temporary = tempfile.TemporaryDirectory()
         app.configure_storage(Path(self.temporary.name))
         app.create_user("11222333000181", "Loja Exemplo A", "store", "senha-loja-a-123")
@@ -51,7 +53,7 @@ class SupportAccessTests(unittest.TestCase):
         self.thread.join()
         restore_storage()
         self.temporary.cleanup()
-        app.MONITORING_ENABLED = self.monitoring
+        config.MONITORING_ENABLED = self.monitoring
 
     def request(self, token, path, data=None):
         from urllib.parse import urlencode
@@ -91,7 +93,7 @@ class SupportAccessTests(unittest.TestCase):
         visit, download = self.log()
         self.assertEqual((visit["action"], visit["store_name"], visit["competence"]), ("abriu_loja", "Loja Exemplo B", "2026-09"))
         self.assertEqual((download["action"], download["file_name"], download["store_cnpj"]), ("baixou_arquivo", "sped-loja-b.txt", "11444777000161"))
-        self.assertEqual(download["machine"], app.socket.gethostname().upper())
+        self.assertEqual(download["machine"], socket.gethostname().upper())
         self.assertEqual(download["ip"], "127.0.0.1")
         self.assertEqual(download["browser"], "Edge no Windows")
         self.assertEqual(download["user_name"], "Suporte Exemplo")
@@ -161,7 +163,7 @@ class MonitoringDisabledTests(unittest.TestCase):
 
     def setUp(self):
         self.setUp_base()
-        app.MONITORING_ENABLED = False
+        config.MONITORING_ENABLED = False
 
     def test_monitoring_is_off_unless_environment_variable_turns_it_on(self):
         import os
@@ -172,7 +174,7 @@ class MonitoringDisabledTests(unittest.TestCase):
                 env = {key: item for key, item in os.environ.items() if key != "PORTAL_MONITORAMENTO"}
                 if value is not None:
                     env["PORTAL_MONITORAMENTO"] = value
-                result = subprocess.run([sys.executable, "-c", "import app; print(app.MONITORING_ENABLED)"], cwd=app.ROOT, env=env, capture_output=True, text=True, check=True)
+                result = subprocess.run([sys.executable, "-c", "from portal import config; print(config.MONITORING_ENABLED)"], cwd=app.ROOT, env=env, capture_output=True, text=True, check=True)
                 self.assertEqual(result.stdout.strip(), expected)
 
     def test_admin_has_no_monitoring_menu_and_pages_are_not_found(self):
@@ -193,7 +195,7 @@ class MonitoringDisabledTests(unittest.TestCase):
         self.assertEqual(self.log(), [])
 
     def test_footer_shows_portal_version(self):
-        self.assertEqual(app.PORTAL_VERSION, "1.5.0")
+        self.assertEqual(config.PORTAL_VERSION, "1.5.0")
         self.assertIn("V1.5.0", self.request("admin-session", "/dashboard")[1].decode())
 
 
