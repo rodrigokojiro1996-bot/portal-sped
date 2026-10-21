@@ -3,11 +3,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import app
+from portal import auth
 from portal import db as storage
 from util import restore_storage
-
-auth_create_user = app.create_user
 
 
 class StorageTests(unittest.TestCase):
@@ -16,10 +14,10 @@ class StorageTests(unittest.TestCase):
             storage.configure_storage(Path(temporary))
             self.addCleanup(restore_storage)
             with self.assertRaisesRegex(ValueError, "CNPJ válido"):
-                auth_create_user("11222333000182", "Loja", "store", "uma-senha-segura-123")
+                auth.create_user("11222333000182", "Loja", "store", "uma-senha-segura-123")
             with self.assertRaisesRegex(ValueError, "12 caracteres"):
-                auth_create_user("11222333000181", "Loja", "store", "curta")
-            auth_create_user("11222333000181", "Loja", "store", "uma-senha-segura-123")
+                auth.create_user("11222333000181", "Loja", "store", "curta")
+            auth.create_user("11222333000181", "Loja", "store", "uma-senha-segura-123")
             with storage.connect() as db:
                 user = db.execute("SELECT id, cnpj, role FROM users").fetchone()
                 for document_type in ("fiscal", "contribuicoes"):

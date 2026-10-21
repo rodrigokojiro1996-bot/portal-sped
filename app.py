@@ -24,6 +24,8 @@ from typing import Iterator
 from urllib.parse import parse_qs, urlparse
 
 import resumo_sped
+from portal.auth import (READABLE_ALPHABET, ROLE_LABELS, STAFF_ROLES, USER_ROLES, create_support_user, create_user, password_digest, readable_password,
+                         reset_store_password, token_hash, verify_password)
 from portal import db as storage
 from portal.db import configure_storage, connect, ensure_secret, initialize_database
 from portal.sped import DOCUMENT_TYPES, SPED_LAYOUTS, PublishError, detect_sped_type, format_cnpj, normalize_cnpj, parse_sped_header, sped_label, valid_cnpj
@@ -33,18 +35,9 @@ from portal.calendario import (LARGE_GROUP_BUSINESS_DAY, LARGE_GROUP_NOTE, SMALL
 
 ROOT = Path(__file__).resolve().parent
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024
-PASSWORD_ITERATIONS = 600_000
 SESSION_SECONDS = 8 * 60 * 60
 LOGIN_FORM_SECONDS = 2 * 60 * 60
-# Senhas geradas pelo portal: sem caracteres que se confundem ao ler ou digitar (0/O, 1/l/I).
-READABLE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
 
-# Perfis de acesso:
-#   admin   - vê todas as lojas, publica arquivos, cadastra lojas e, com o monitoramento ativo, vê as ações do suporte;
-#   support - vê todas as lojas e baixa arquivos (somente consulta); com o monitoramento ativo, tudo o que faz é registrado;
-#   store   - vê só as lojas do próprio grupo (mesma raiz de CNPJ).
-USER_ROLES = ("admin", "support", "store")
-STAFF_ROLES = ("admin", "support")
 AUDITED_ROLES = ("support",)
 
 PORTAL_VERSION = "1.5.0"
@@ -55,8 +48,6 @@ PORTAL_VERSION = "1.5.0"
 # registradas. O código, a tabela audit_log e o histórico já gravado continuam no lugar.
 # Para reativar: inicie o portal com a variável de ambiente PORTAL_MONITORAMENTO=1.
 MONITORING_ENABLED = os.environ.get("PORTAL_MONITORAMENTO", "0") == "1"
-ROLE_LABELS = {"admin": "Administração", "support": "Suporte", "store": "Acesso da loja"}
-
 
 def publish_sped(content: bytes, file_name: str) -> dict[str, str | int]:
     """Publicação automática: o tipo, a loja (pelo CNPJ) e a competência vêm do registro 0000 do próprio arquivo."""
@@ -93,75 +84,6 @@ def publish_sped(content: bytes, file_name: str) -> dict[str, str | int]:
         document = db.execute("SELECT * FROM documents WHERE id=?", (doc_id,)).fetchone()
     document_summary(document)
     return {"id": doc_id, "store_id": store["id"], "store_name": store["name"], "cnpj": store["cnpj"], "document_type": document_type, "competence": header["competence"]}
-
-
-def password_digest(password: str) -> str:
-    salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PASSWORD_ITERATIONS)
-    return f"pbkdf2_sha256${PASSWORD_ITERATIONS}${salt.hex()}${digest.hex()}"
-
-
-def verify_password(password: str, stored: str) -> bool:
-    try:
-        algorithm, iterations, salt_hex, digest_hex = stored.split("$")
-        if algorithm != "pbkdf2_sha256":
-            return False
-        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(iterations))
-        return hmac.compare_digest(actual.hex(), digest_hex)
-    except (ValueError, TypeError):
-        return False
-
-
-def create_user(cnpj: str | None, name: str, role: str, password: str, login_name: str | None = None) -> None:
-    if role not in USER_ROLES:
-        raise ValueError("Perfil de acesso desconhecido.")
-    normalized = normalize_cnpj(cnpj or "") if role == "store" else None
-    if role == "store" and not valid_cnpj(normalized or ""):
-        raise ValueError("Informe um CNPJ válido.")
-    username = (login_name or "").strip().lower() if role in STAFF_ROLES else None
-    if role in STAFF_ROLES and (not username or not re.fullmatch(r"[a-z0-9._-]{3,40}", username)):
-        raise ValueError("O usuário deve ter 3 a 40 caracteres: letras, números, ponto, hífen ou sublinhado.")
-    if len(password) < 12:
-        raise ValueError("A senha deve ter pelo menos 12 caracteres.")
-    with connect() as db:
-        db.execute(
-            "INSERT INTO users (cnpj, login_name, name, role, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (normalized, username, name.strip(), role, password_digest(password), datetime.now(timezone.utc).isoformat()),
-        )
-
-
-def readable_password() -> str:
-    """Senha no formato Kp7m-Xq4t-Rw9z: 12 caracteres sem 0/O e 1/l/I, fácil de ler e digitar."""
-    return "-".join("".join(secrets.choice(READABLE_ALPHABET) for _ in range(4)) for _ in range(3))
-
-
-def reset_store_password(identifier: str) -> tuple[str, str]:
-    """Gera uma senha nova (loja pelo CNPJ ou suporte pelo usuário), encerra as sessões e libera bloqueios de login."""
-    digits = normalize_cnpj(identifier)
-    password = readable_password()
-    with connect() as db:
-        if len(digits) == 14:
-            account = db.execute("SELECT id, name FROM users WHERE role='store' AND cnpj=?", (digits,)).fetchone()
-            missing = "Nenhuma loja cadastrada com esse CNPJ."
-        else:
-            account = db.execute("SELECT id, name FROM users WHERE role='support' AND login_name=?", (identifier.strip().lower(),)).fetchone()
-            missing = "Nenhum usuário de suporte com esse nome. Informe o CNPJ da loja ou o usuário do suporte."
-        if not account:
-            raise ValueError(missing)
-        db.execute("UPDATE users SET password_hash=?, active=1 WHERE id=?", (password_digest(password), account["id"]))
-        db.execute("DELETE FROM sessions WHERE user_id=?", (account["id"],))
-        db.execute("DELETE FROM login_attempts")
-    return account["name"], password
-
-
-def create_support_user(login_name: str, name: str) -> str:
-    """Cria um usuário de suporte (somente consulta e download) e devolve a senha gerada."""
-    password = readable_password()
-    try:
-        create_user(None, name, "support", password, login_name)
-    except sqlite3.IntegrityError as error:
-        raise ValueError(f"Já existe um usuário chamado '{login_name}'.") from error
-    return password
 
 
 # --------------------------------------------------------------------------- monitoramento do suporte
@@ -279,10 +201,6 @@ def document_summary(document: sqlite3.Row) -> dict | None:
 def competence_summary(documents: list[sqlite3.Row], competence: str) -> dict | None:
     published = sorted((doc for doc in documents if doc["competence"] == competence), key=lambda doc: doc["uploaded_at"])
     return resumo_sped.merge([summary for summary in (document_summary(doc) for doc in published) if summary])
-
-
-def token_hash(token: str) -> str:
-    return hashlib.sha256(token.encode("ascii")).hexdigest()
 
 
 def h(value: object) -> str:
