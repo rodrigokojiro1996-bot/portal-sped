@@ -12,10 +12,12 @@ from __future__ import annotations
 import getpass
 import sqlite3
 import sys
+import tempfile
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 from portal import config
+from portal import db as storage
 from portal.auth import create_support_user, create_user, reset_store_password
 from portal.db import configure_storage, connect
 from portal.handler import PortalHandler
@@ -91,10 +93,40 @@ def serve() -> None:
         server.server_close()
 
 
+def startup_problems() -> list[str]:
+    """Checagem de inicialização: configuração, pasta de dados gravável, segredo e banco na migração esperada.
+
+    Devolve a lista de problemas (vazia se está tudo certo). Prepara o armazenamento e aplica as migrações pendentes.
+    """
+    problems = list(config.PROBLEMS)
+    try:
+        configure_storage()
+    except Exception as error:  # noqa: BLE001 - qualquer falha aqui impede o portal de subir
+        return problems + [f"Não foi possível abrir a pasta de dados {storage.DATA_DIR} ou o banco: {type(error).__name__}: {error}"]
+    for folder in (storage.DATA_DIR, storage.DOCUMENTS):
+        try:
+            with tempfile.NamedTemporaryFile(dir=folder, prefix=".teste-escrita-"):
+                pass
+        except OSError as error:
+            problems.append(f"A pasta {folder} não aceita gravação: {error}")
+    secret = storage.DATA_DIR / ".secret"
+    if not secret.is_file() or secret.stat().st_size < 32:
+        problems.append(f"O segredo local {secret} está ausente ou incompleto.")
+    version, expected = storage.schema_version(), storage.latest_version()
+    if version != expected:
+        problems.append(f"O banco está na migração {version}, mas este código espera a {expected}.")
+    return problems
+
+
 def main(argv: list[str] | None = None) -> None:
     args = sys.argv[1:] if argv is None else argv
     command, rest = (args[0], args[1:]) if args else ("", [])
-    configure_storage()
+    problems = startup_problems()
+    if problems:
+        print("O Portal Fiscal não pode iniciar:", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        raise SystemExit(2)
     if command == "create-admin":
         create_admin()
     elif command == "criar-suporte":

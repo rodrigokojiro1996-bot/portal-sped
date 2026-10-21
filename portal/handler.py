@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import re
 import secrets
 import sqlite3
+import sys
 import time
 from datetime import date
 from email.parser import BytesParser
@@ -163,6 +165,9 @@ class PortalHandler(BaseHTTPRequestHandler):
             name, content_type, max_age = STATIC_FILES[path]
             self.send_bytes(HTTPStatus.OK, (config.ROOT / "static" / name).read_bytes(), content_type, {"Cache-Control": f"public, max-age={max_age}"})
             return
+        if path == "/saude":
+            self.health()
+            return
         if path in ("/", "/login"):
             if self.get_user():
                 self.redirect("/dashboard")
@@ -187,6 +192,26 @@ class PortalHandler(BaseHTTPRequestHandler):
                 self.monitoring_page(user)
         else:
             self.send_message(HTTPStatus.NOT_FOUND, "Página não encontrada", "Página não encontrada", user)
+
+    def health(self) -> None:
+        """Rota de saúde, sem login: o banco responde e está na versão de migração que este código espera.
+
+        Usada pelo iniciar-portal.bat e pelo servico-windows.ps1 para saber se o portal está no ar de verdade.
+        Em caso de falha devolve 503 com uma mensagem genérica; o detalhe vai só para o log do servidor.
+        """
+        body: dict[str, object] = {"ok": False, "versao": config.PORTAL_VERSION}
+        try:
+            with connect() as db:
+                db.execute("SELECT 1").fetchone()
+            version, expected = storage.schema_version(), storage.latest_version()
+            body.update(ok=version == expected, migracao=version)
+            if version != expected:
+                body["erro"] = f"Banco na migração {version}; este código espera a {expected}."
+        except Exception as error:  # noqa: BLE001 - qualquer falha do banco deixa o portal "não saudável"
+            print(f"/saude: {type(error).__name__}: {error}", file=sys.stderr)
+            body["erro"] = "Banco de dados indisponível."
+        status = HTTPStatus.OK if body["ok"] else HTTPStatus.SERVICE_UNAVAILABLE
+        self.send_bytes(status, json.dumps(body, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
 
     def dashboard_workspace(self, user: sqlite3.Row, dialog: str = "", status: int = HTTPStatus.OK) -> None:
         """Tela principal: barra lateral (loja e tipo de SPED) e área de trabalho da loja ou da rede."""
