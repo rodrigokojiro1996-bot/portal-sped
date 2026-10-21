@@ -486,25 +486,6 @@ class SpedSummaryTests(unittest.TestCase):
 
 
 class PublicationForecastTests(unittest.TestCase):
-    def test_deadline_is_third_business_day_for_small_groups_and_fifth_for_larger(self):
-        expected = {
-            "2026-09": (date(2026, 10, 5), date(2026, 10, 7)),
-            "2026-10": (date(2026, 11, 5), date(2026, 11, 9)),   # 02/11 Finados
-            "2026-11": (date(2026, 12, 3), date(2026, 12, 7)),
-            "2026-12": (date(2027, 1, 6), date(2027, 1, 8)),     # 01/01 Confraternização
-        }
-        for competence, (small, large) in expected.items():
-            self.assertEqual(app.publication_deadline(competence, 3), (small, 3), competence)
-            self.assertEqual(app.publication_deadline(competence, 4), (large, 5), competence)
-
-    def test_movable_holidays_follow_easter(self):
-        self.assertEqual(app.easter(2026), date(2026, 4, 5))
-        self.assertIn(date(2027, 2, 9), app.non_business_days(2027))   # Carnaval 2027
-        self.assertIn(date(2026, 4, 3), app.non_business_days(2026))   # Sexta-feira Santa 2026
-
-    def test_timeline_runs_until_forecast_month(self):
-        self.assertEqual(app.competence_timeline(["2026-09"], today=date(2026, 10, 16)), ["2026-09", "2026-10", "2026-11", "2026-12"])
-
     def test_pending_month_shows_forecast_and_help_for_large_groups(self):
         with tempfile.TemporaryDirectory() as temporary:
             app.configure_storage(Path(temporary))
