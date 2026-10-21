@@ -6,7 +6,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
 
-import app
+from portal.handler import PortalHandler
 from portal import auth
 from portal import db as storage
 from util import restore_storage
@@ -51,7 +51,7 @@ class LoginFormTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         storage.configure_storage(Path(self.temporary.name))
         auth.create_user("11222333000181", "Loja Exemplo", "store", "senha-correta-123")
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), app.PortalHandler)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), PortalHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"

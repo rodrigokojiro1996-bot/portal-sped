@@ -3,8 +3,8 @@ import threading
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-import app
 from portal import config, db
+from portal.handler import PortalHandler
 
 STORE_A_CNPJ, STORE_B_CNPJ, UNREGISTERED_CNPJ = "11222333000181", "11444777000161", "45543915000181"
 
@@ -18,7 +18,7 @@ class TestServer:
     """Portal rodando numa porta livre, para testes que fazem requisições HTTP."""
 
     def __init__(self):
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), app.PortalHandler)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), PortalHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"

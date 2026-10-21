@@ -12,10 +12,12 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-import app
+from portal.handler import PortalHandler
+from portal.views import layout
+from portal import auth
 from portal import config
 from portal import db as storage
-from util import restore_storage
+from util import CONTRIBUTIONS_SAMPLE, FISCAL_SAMPLE, STORE_A_CNPJ, STORE_B_CNPJ, UNREGISTERED_CNPJ, restore_storage, sped
 import resumo_sped
 
 
@@ -29,20 +31,20 @@ class SupportAccessTests(unittest.TestCase):
         self.monitoring = config.MONITORING_ENABLED
         config.MONITORING_ENABLED = True
         self.temporary = tempfile.TemporaryDirectory()
-        app.configure_storage(Path(self.temporary.name))
-        app.create_user("11222333000181", "Loja Exemplo A", "store", "senha-loja-a-123")
-        app.create_user("11444777000161", "Loja Exemplo B", "store", "senha-loja-b-123")
-        app.create_user(None, "Admin Exemplo", "admin", "senha-admin-123", "admin.teste")
-        self.support_password = app.create_support_user("suporte.teste", "Suporte Exemplo")
-        with app.connect() as db:
+        storage.configure_storage(Path(self.temporary.name))
+        auth.create_user("11222333000181", "Loja Exemplo A", "store", "senha-loja-a-123")
+        auth.create_user("11444777000161", "Loja Exemplo B", "store", "senha-loja-b-123")
+        auth.create_user(None, "Admin Exemplo", "admin", "senha-admin-123", "admin.teste")
+        self.support_password = auth.create_support_user("suporte.teste", "Suporte Exemplo")
+        with storage.connect() as db:
             ids = {row["name"]: row["id"] for row in db.execute("SELECT id, name FROM users")}
             self.store_b = ids["Loja Exemplo B"]
             for user_id, token in ((ids["Suporte Exemplo"], "support-session"), (ids["Admin Exemplo"], "admin-session"), (ids["Loja Exemplo A"], "store-session")):
-                db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (app.token_hash(token), user_id, "csrf-" + token, int(time.time()) + 3600))
+                db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (auth.token_hash(token), user_id, "csrf-" + token, int(time.time()) + 3600))
             content = b"conteudo do sped da loja b"
             db.execute("INSERT INTO documents VALUES ('doc-b', ?, 'fiscal', '2026-09', 'sped-loja-b.txt', ?, ?, ?)", (self.store_b, len(content), hashlib.sha256(content).hexdigest(), "2026-10-12T00:00:00+00:00"))
         (storage.DOCUMENTS / "doc-b.txt").write_bytes(content)
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), app.PortalHandler)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), PortalHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"
@@ -67,7 +69,7 @@ class SupportAccessTests(unittest.TestCase):
                 return error.code, error.read()
 
     def log(self):
-        with app.connect() as db:
+        with storage.connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM audit_log ORDER BY id")]
 
     def test_support_sees_every_store_and_downloads_but_cannot_publish(self):
@@ -146,9 +148,9 @@ class SupportAccessTests(unittest.TestCase):
             legacy.commit()
             legacy.close()
             try:
-                app.configure_storage(Path(temporary))
-                app.create_support_user("suporte.migrado", "Suporte Migrado")
-                with app.connect() as db:
+                storage.configure_storage(Path(temporary))
+                auth.create_support_user("suporte.migrado", "Suporte Migrado")
+                with storage.connect() as db:
                     self.assertEqual(db.execute("SELECT name FROM users WHERE id=7").fetchone()[0], "Loja Antiga")
                     self.assertEqual(db.execute("SELECT store_id FROM documents WHERE id='d1'").fetchone()[0], 7)
                     self.assertEqual(db.execute("SELECT role FROM users WHERE login_name='suporte.migrado'").fetchone()[0], "support")
@@ -174,7 +176,7 @@ class MonitoringDisabledTests(unittest.TestCase):
                 env = {key: item for key, item in os.environ.items() if key != "PORTAL_MONITORAMENTO"}
                 if value is not None:
                     env["PORTAL_MONITORAMENTO"] = value
-                result = subprocess.run([sys.executable, "-c", "from portal import config; print(config.MONITORING_ENABLED)"], cwd=app.ROOT, env=env, capture_output=True, text=True, check=True)
+                result = subprocess.run([sys.executable, "-c", "from portal import config; print(config.MONITORING_ENABLED)"], cwd=config.ROOT, env=env, capture_output=True, text=True, check=True)
                 self.assertEqual(result.stdout.strip(), expected)
 
     def test_admin_has_no_monitoring_menu_and_pages_are_not_found(self):
@@ -202,18 +204,18 @@ class MonitoringDisabledTests(unittest.TestCase):
 class BranchAccessTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        app.configure_storage(Path(self.temporary.name))
-        app.create_user("11444777000161", "Farmácia Matriz", "store", "senha-matriz-demo-123")
-        app.create_user("11444777000242", "Farmácia Filial", "store", "senha-filial-demo-123")
-        app.create_user("11222333000181", "Outra Rede", "store", "senha-outra-rede-123")
-        with app.connect() as db:
+        storage.configure_storage(Path(self.temporary.name))
+        auth.create_user("11444777000161", "Farmácia Matriz", "store", "senha-matriz-demo-123")
+        auth.create_user("11444777000242", "Farmácia Filial", "store", "senha-filial-demo-123")
+        auth.create_user("11222333000181", "Outra Rede", "store", "senha-outra-rede-123")
+        with storage.connect() as db:
             self.matrix_id = db.execute("SELECT id FROM users WHERE cnpj=?", ("11444777000161",)).fetchone()["id"]
             self.branch_id = db.execute("SELECT id FROM users WHERE cnpj=?", ("11444777000242",)).fetchone()["id"]
             other_id = db.execute("SELECT id FROM users WHERE cnpj=?", ("11222333000181",)).fetchone()["id"]
-            db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (app.token_hash("matrix-test-session"), self.matrix_id, "csrf-test", int(time.time()) + 3600))
+            db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (auth.token_hash("matrix-test-session"), self.matrix_id, "csrf-test", int(time.time()) + 3600))
             self.branch_document = self.add_document(db, self.branch_id, "filial.txt", b"documento da filial")
             self.other_document = self.add_document(db, other_id, "outra-rede.txt", b"documento de outra rede")
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), app.PortalHandler)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), PortalHandler)
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.server_thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
@@ -251,49 +253,17 @@ class BranchAccessTests(unittest.TestCase):
         error.exception.close()
 
 
-FISCAL_SAMPLE = "\r\n".join((
-    "|0000|020|0|01092026|30092026|FARMACIA EXEMPLO LTDA|11222333000181||RS|0000000000|4314902|00000||A|1|",
-    "|0150|11444777000161|DISTRIBUIDORA EXEMPLO SA|1058|11444777000161||||||||",
-    "|C100|1|0||65|00|1|101||02092026|02092026|150|0|0|0|150|9|0|0|0|100|17|0|0|0|0|0|0|0|",
-    "|C190|060|5405|0|100|0|0|0|0|0|0||",
-    "|C190|000|5102|17|50|50|8,5|0|0|0|0||",
-    "|C100|1|0||65|02|1|102||02092026|02092026|999|0|0|0|999|9|0|0|0|0|0|0|0|0|0|0|0|0|",
-    "|C190|000|5102|17|999|999|169,83|0|0|0|0||",
-    "|C100|0|1|11444777000161|55|00|1|555||01092026|03092026|80|0|0|0|80|9|0|0|0|0|0|0|0|0|0|0|0|0|",
-    "|C190|060|1403|0|60|0|0|0|0|0|0||",
-    "|C190|000|1102|17|20|20|3,4|0|0|0|0||",
-    "|C100|1|0||55|00|1|103||05092026|05092026|30|0|0|0|30|9|0|0|0|0|0|0|0|0|0|0|0|0|",
-    "|C190|000|5929|17|30|30|5,1|0|0|0|0||",
-    "|E110|8,5|0|0|0|3,4|0|0|0|0|5,1|0|5,1|0|0|",
-    "|E116|000|5,1|12102026|0221|||||092026|",
-    "|E210|1|0|0|0|0|0|0|0|0|0|0|1,5|0|0|",
-))
-
-CONTRIBUTIONS_SAMPLE = "\r\n".join((
-    "|0000|006|0|0||01092026|30092026|FARMACIA EXEMPLO LTDA|11222333000181||RS|4314902||00|",
-    "|0140|0001|LOJA MATRIZ|11222333000181|RS||4314902|||",
-    "|C010|11222333000181|2|",
-    "|C100|1|0||65|00|1|1||02092026|02092026|200|0|0|0|200|9|0|0|0|0|0|0|0|0|0|0|0|0|",
-    "|C175|5405|200|10|04|0|0|||0|04|0|0|||0||",
-    "|C100|0|1|11444777000161|55|00|1|2||01092026|01092026|120|0|0|0|120|9|0|0|0|0|0|0|0|0|0|0|0|0|",
-    "|M200|0|0|0|0|0|0|0|0,65|0|0|0,65|0,65|",
-    "|M210|51|100|100|0|0|100|0,65|0||0,65|0|0|0|0|0,65|",
-    "|M400|04|300||",
-    "|M600|0|0|0|0|0|0|0|3|0|0|3|3|",
-))
-
-
 class PublicationForecastTests(unittest.TestCase):
     def test_pending_month_shows_forecast_and_help_for_large_groups(self):
         with tempfile.TemporaryDirectory() as temporary:
-            app.configure_storage(Path(temporary))
+            storage.configure_storage(Path(temporary))
             try:
                 for cnpj in ("11444777000161", "11444777000242", "11444777000323", "11444777000404"):
-                    app.create_user(cnpj, f"Rede Exemplo - {cnpj[8:12]}", "store", "senha-exemplo-123")
-                with app.connect() as db:
+                    auth.create_user(cnpj, f"Rede Exemplo - {cnpj[8:12]}", "store", "senha-exemplo-123")
+                with storage.connect() as db:
                     store_id = db.execute("SELECT id FROM users WHERE cnpj='11444777000161'").fetchone()["id"]
-                    db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (app.token_hash("forecast-session"), store_id, "csrf", int(time.time()) + 3600))
-                server = ThreadingHTTPServer(("127.0.0.1", 0), app.PortalHandler)
+                    db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (auth.token_hash("forecast-session"), store_id, "csrf", int(time.time()) + 3600))
+                server = ThreadingHTTPServer(("127.0.0.1", 0), PortalHandler)
                 thread = threading.Thread(target=server.serve_forever, daemon=True)
                 thread.start()
                 try:
@@ -313,16 +283,16 @@ class PublicationForecastTests(unittest.TestCase):
 class DashboardSummaryTests(unittest.TestCase):
     def test_store_dashboard_shows_summary_of_selected_competence(self):
         with tempfile.TemporaryDirectory() as temporary:
-            app.configure_storage(Path(temporary))
+            storage.configure_storage(Path(temporary))
             try:
-                app.create_user("11222333000181", "Farmácia Exemplo", "store", "senha-exemplo-123")
+                auth.create_user("11222333000181", "Farmácia Exemplo", "store", "senha-exemplo-123")
                 content = FISCAL_SAMPLE.encode()
-                with app.connect() as db:
+                with storage.connect() as db:
                     store_id = db.execute("SELECT id FROM users").fetchone()["id"]
-                    db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (app.token_hash("summary-session"), store_id, "csrf", int(time.time()) + 3600))
+                    db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (auth.token_hash("summary-session"), store_id, "csrf", int(time.time()) + 3600))
                     db.execute("INSERT INTO documents VALUES (?, ?, 'fiscal', '2026-09', 'sped.txt', ?, ?, ?)", ("doc-1", store_id, len(content), hashlib.sha256(content).hexdigest(), "2026-10-12T00:00:00+00:00"))
                 (storage.DOCUMENTS / "doc-1.txt").write_bytes(content)
-                server = ThreadingHTTPServer(("127.0.0.1", 0), app.PortalHandler)
+                server = ThreadingHTTPServer(("127.0.0.1", 0), PortalHandler)
                 thread = threading.Thread(target=server.serve_forever, daemon=True)
                 thread.start()
                 try:
@@ -334,7 +304,7 @@ class DashboardSummaryTests(unittest.TestCase):
                 self.assertIn("Setembro/2026", page)
                 self.assertIn("R$ 150,00", page)
                 self.assertIn("href='/download/doc-1'", page)
-                with app.connect() as db:
+                with storage.connect() as db:
                     self.assertEqual(db.execute("SELECT COUNT(*) FROM document_summaries").fetchone()[0], 1)
             finally:
                 restore_storage()
@@ -343,32 +313,20 @@ class DashboardSummaryTests(unittest.TestCase):
 STORE_A_CNPJ, STORE_B_CNPJ, UNREGISTERED_CNPJ = "11222333000181", "11444777000161", "45543915000181"
 
 
-def sped(sample, cnpj=STORE_A_CNPJ, period="01092026|30092026"):
-    """Amostra SPED com outro CNPJ e período no registro 0000 (as demais linhas ficam como estão)."""
-    first, rest = sample.split("\r\n", 1)
-    fields = first.split("|")
-    start, end = period.split("|")
-    if fields[2] == "006":  # Contribuições
-        fields[6], fields[7], fields[9] = start, end, cnpj
-    else:
-        fields[4], fields[5], fields[7] = start, end, cnpj
-    return ("|".join(fields) + "\r\n" + rest).encode()
-
-
 class AutoPublishTests(unittest.TestCase):
     """Publicação automática: o portal acha a loja pelo CNPJ, a competência pelo período e a aba pelo tipo do arquivo."""
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        app.configure_storage(Path(self.temporary.name))
-        app.create_user(STORE_A_CNPJ, "Farmácia Centro", "store", "senha-centro-123")
-        app.create_user(STORE_B_CNPJ, "Farmácia Bairro", "store", "senha-bairro-123")
-        app.create_user(None, "Admin Exemplo", "admin", "senha-admin-123", "admin.teste")
-        with app.connect() as db:
+        storage.configure_storage(Path(self.temporary.name))
+        auth.create_user(STORE_A_CNPJ, "Farmácia Centro", "store", "senha-centro-123")
+        auth.create_user(STORE_B_CNPJ, "Farmácia Bairro", "store", "senha-bairro-123")
+        auth.create_user(None, "Admin Exemplo", "admin", "senha-admin-123", "admin.teste")
+        with storage.connect() as db:
             ids = {row["name"]: row["id"] for row in db.execute("SELECT id, name FROM users")}
-            db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (app.token_hash("admin-session"), ids["Admin Exemplo"], "csrf-admin", int(time.time()) + 3600))
+            db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (auth.token_hash("admin-session"), ids["Admin Exemplo"], "csrf-admin", int(time.time()) + 3600))
         self.store_a, self.store_b = ids["Farmácia Centro"], ids["Farmácia Bairro"]
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), app.PortalHandler)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), PortalHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"
@@ -381,7 +339,7 @@ class AutoPublishTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def documents(self):
-        with app.connect() as db:
+        with storage.connect() as db:
             return [dict(row) for row in db.execute("SELECT store_id, document_type, competence, original_name FROM documents ORDER BY uploaded_at")]
 
     def stored_files(self):
@@ -442,7 +400,7 @@ class AutoPublishTests(unittest.TestCase):
 
     def test_popup_disappears_when_closed(self):
         # "OK, entendi" fecha o <dialog> tirando o atributo open; o CSS não pode manter o pop-up visível sem ele.
-        css = (app.ROOT / "static" / "styles.css").read_text(encoding="utf-8")
+        css = (config.ROOT / "static" / "styles.css").read_text(encoding="utf-8")
         self.assertIn(".publish-dialog:not([open]){display:none}", css)
         status, _, page = self.post_file(sped(FISCAL_SAMPLE))
         self.assertEqual(status, 200)
@@ -451,18 +409,18 @@ class AutoPublishTests(unittest.TestCase):
     def test_stylesheet_address_changes_with_its_content_so_browser_cache_is_refreshed(self):
         with urlopen(Request(self.base + "/dashboard", headers={"Cookie": "portal_session=admin-session"})) as response:
             page = response.read().decode()
-        self.assertIn(f"href='/static/styles.css?v={app.STYLES_VERSION}'", page)
-        expected = hashlib.sha256((app.ROOT / "static" / "styles.css").read_bytes()).hexdigest()[:10]
-        self.assertEqual(app.STYLES_VERSION, expected)
-        with urlopen(self.base + f"/static/styles.css?v={app.STYLES_VERSION}") as response:
+        self.assertIn(f"href='/static/styles.css?v={layout.STYLES_VERSION}'", page)
+        expected = hashlib.sha256((config.ROOT / "static" / "styles.css").read_bytes()).hexdigest()[:10]
+        self.assertEqual(layout.STYLES_VERSION, expected)
+        with urlopen(self.base + f"/static/styles.css?v={layout.STYLES_VERSION}") as response:
             self.assertIn(b".publish-dialog:not([open])", response.read())
 
     def test_popup_closes_with_escape_key(self):
         # O Esc só fecha um <dialog> aberto como modal; o script reabre o pop-up com showModal() e ainda trata o Esc.
         status, _, page = self.post_file(sped(FISCAL_SAMPLE))
         self.assertEqual(status, 200)
-        self.assertIn(f"<script src='/static/portal.js?v={app.SCRIPT_VERSION}' defer></script>", page)
-        with urlopen(self.base + f"/static/portal.js?v={app.SCRIPT_VERSION}") as response:
+        self.assertIn(f"<script src='/static/portal.js?v={layout.SCRIPT_VERSION}' defer></script>", page)
+        with urlopen(self.base + f"/static/portal.js?v={layout.SCRIPT_VERSION}") as response:
             self.assertEqual(response.headers["Content-Type"], "text/javascript; charset=utf-8")
             script = response.read().decode()
         self.assertIn("dialog.publish-dialog[open]", script)
