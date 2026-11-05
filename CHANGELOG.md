@@ -2,6 +2,20 @@
 
 Mudanças do Portal Fiscal por versão. Detalhes técnicos em [docs/versao-1.6.md](docs/versao-1.6.md) e [docs/versao-1.5.md](docs/versao-1.5.md).
 
+## Em desenvolvimento
+
+### Adicionado
+- **Contatos dos avisos** (`python app.py importar-contatos ARQUIVO.xlsx [--aplicar]`): lê uma planilha com as colunas `CNPJ`, `SPED SPA` e `CONTATO` e separa destinatários e cópias. Sem `--aplicar`, só mostra o resultado. Lojas fechadas ficam de fora.
+- **Fila de avisos de publicação, em modo de teste** (`PORTAL_EMAIL=1`). Cada arquivo publicado de uma loja com contato gera um aviso na tela **E-mails** da administração.
+  - Nenhum e-mail sai do portal: o código não tem chamada de rede, e um aviso de teste nunca vira e-mail de verdade.
+  - O aviso nasce na mesma transação do documento e é processado depois da resposta. Uma falha na fila não atinge quem publicou.
+  - Ao iniciar, o portal retoma até 20 avisos com menos de 48 h. O botão **Reprocessar pendentes** processa até 25 por clique. Depois de 5 tentativas, o aviso espera uma pessoa.
+  - `PORTAL_EMAIL_REDIRECIONAR` troca todos os destinatários; preenchido com um valor inválido, o aviso dá erro em vez de usar o endereço real.
+- Migração `005`: tabelas `store_contacts` e `email_notifications`.
+
+### Corrigido
+- Se a gravação da publicação falhasse com erro do banco, o arquivo ficava na pasta `documentos/` sem registro.
+
 ## 1.6.0 — 2026-10-20
 
 ### Adicionado

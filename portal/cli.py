@@ -7,6 +7,7 @@ Comandos:
     redefinir-senha     gera senha nova para uma loja (CNPJ) ou suporte (usuário)
     gerar-resumos       recalcula os resumos fiscais dos arquivos publicados
     backup              copia banco, documentos e segredo: [--destino PASTA] [--manter DIAS]
+    importar-contatos   lê os contatos dos avisos de uma planilha .xlsx: ARQUIVO [--aplicar]
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ import tempfile
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from portal import config
+from portal import config, contatos, emails
 from portal import db as storage
 from portal.auth import create_support_user, create_user, reset_store_password
 from portal.backup import BackupError, run_backup
@@ -101,9 +102,35 @@ def backup(args: list[str]) -> None:
     print(f"Backup concluído e conferido: {target}")
 
 
+def import_contacts(args: list[str]) -> None:
+    """Mostra o que a planilha traz e só grava com --aplicar: a lista alcança destinatários reais e merece conferência."""
+    apply = "--aplicar" in args
+    files = [arg for arg in args if arg != "--aplicar"]
+    if len(files) != 1:
+        raise SystemExit("Uso: python app.py importar-contatos ARQUIVO.xlsx [--aplicar]")
+    try:
+        result = contatos.select_contacts(contatos.read_xlsx(Path(files[0])))
+    except (contatos.ContactFileError, OSError) as error:
+        raise SystemExit(f"Importação não concluída: {error}") from error
+    print(f"Planilha: {result.rows} linhas. Prontas para importar: {len(result.contacts)} lojas.")
+    for label, names in (("Lojas fechadas, ignoradas", result.closed), ("Marcadas com SIM e sem e-mail", result.without_email), ("CNPJ inválido", result.invalid_cnpj),
+                         ("Mesmo CNPJ com contatos diferentes (vale o primeiro)", result.conflicts), ("CNPJ repetido na planilha", [format_cnpj(cnpj) for cnpj in result.repeated])):
+        if names:
+            print(f"{label}: {len(names)} ({', '.join(names)})")
+    missing = contatos.unregistered_stores(list(result.contacts))
+    if missing:
+        print(f"Sem loja ativa no portal: {len(missing)}. O contato fica guardado e passa a valer quando a loja for cadastrada.")
+    if apply:
+        contatos.save_contacts(result.contacts)
+        print(f"Contatos gravados: {len(result.contacts)}.")
+    else:
+        print("Nada foi gravado. Para gravar, rode de novo com --aplicar.")
+
+
 def serve() -> None:
     server = ThreadingHTTPServer((config.HOST, config.PORT), PortalHandler)
-    print(f"Portal Fiscal {config.PORTAL_VERSION} ativo em http://{config.HOST}:{config.PORT} (monitoramento do suporte {'ativo' if config.MONITORING_ENABLED else 'desativado'})")
+    print(f"Portal Fiscal {config.PORTAL_VERSION} ativo em http://{config.HOST}:{config.PORT} (monitoramento do suporte {'ativo' if config.MONITORING_ENABLED else 'desativado'}, e-mails {'em modo de teste' if config.EMAIL_ENABLED else 'desligados'})")
+    emails.sweep_on_start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -156,6 +183,8 @@ def main(argv: list[str] | None = None) -> None:
         rebuild_summaries()
     elif command == "backup":
         backup(rest)
+    elif command == "importar-contatos":
+        import_contacts(rest)
     elif command == "":
         serve()
     else:
