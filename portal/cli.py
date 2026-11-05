@@ -8,6 +8,7 @@ Comandos:
     gerar-resumos       recalcula os resumos fiscais dos arquivos publicados
     backup              copia banco, documentos e segredo: [--destino PASTA] [--manter DIAS]
     importar-contatos   lê os contatos dos avisos de uma planilha .xlsx: ARQUIVO [--aplicar]
+    conferir-certificado  mostra o que o portal lê de um certificado (.cer ou .pem): ARQUIVO
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ import tempfile
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from portal import config, contatos, emails
+from portal import certificado, config, contatos, emails
 from portal import db as storage
 from portal.auth import create_support_user, create_user, reset_store_password
 from portal.backup import BackupError, run_backup
@@ -127,6 +128,25 @@ def import_contacts(args: list[str]) -> None:
         print("Nada foi gravado. Para gravar, rode de novo com --aplicar.")
 
 
+def check_certificate(args: list[str]) -> None:
+    """Mostra o que o portal lê de um certificado, para conferir um e-CNPJ de verdade antes de depender dele."""
+    if len(args) != 1:
+        raise SystemExit("Uso: python app.py conferir-certificado ARQUIVO.cer")
+    try:
+        certificate = certificado.read_file(Path(args[0]))
+    except (certificado.CertificateError, OSError) as error:
+        raise SystemExit(f"Certificado não conferido: {error}") from error
+    print(f"CNPJ: {format_cnpj(certificate.cnpj)} (raiz {certificate.cnpj[:8]})")
+    print(f"Validade: {certificate.not_before:%d/%m/%Y} a {certificate.not_after:%d/%m/%Y}")
+    try:
+        certificado.check_validity(certificate)
+        print("Situação: dentro da validade.")
+    except certificado.CertificateError as error:
+        print(f"Situação: {error}")
+    stores = certificado.stores_of(certificate.cnpj)
+    print(f"Lojas ativas no portal com esta raiz: {len(stores)}" + (f" ({', '.join(store['name'] for store in stores)})" if stores else ""))
+
+
 def serve() -> None:
     server = ThreadingHTTPServer((config.HOST, config.PORT), PortalHandler)
     print(f"Portal Fiscal {config.PORTAL_VERSION} ativo em http://{config.HOST}:{config.PORT} (monitoramento do suporte {'ativo' if config.MONITORING_ENABLED else 'desativado'}, e-mails {'em modo de teste' if config.EMAIL_ENABLED else 'desligados'})")
@@ -185,6 +205,8 @@ def main(argv: list[str] | None = None) -> None:
         backup(rest)
     elif command == "importar-contatos":
         import_contacts(rest)
+    elif command == "conferir-certificado":
+        check_certificate(rest)
     elif command == "":
         serve()
     else:

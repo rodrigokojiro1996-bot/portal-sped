@@ -117,6 +117,14 @@ class ProcessTests(QueueCase):
         with mock.patch.object(config, "PUBLIC_URL", "https://portal.example.com"):
             emails.process_pending()
         self.assertIn(f"https://portal.example.com/dashboard?store_id={published['store_id']}&type=fiscal&competence=2026-09", queue()[0]["body"])
+        self.assertNotIn("certificado", queue()[0]["body"])
+
+    def test_link_asks_for_the_certificate_only_with_the_entry_turned_on(self):
+        published = self.publish()
+        with mock.patch.object(config, "PUBLIC_URL", "https://portal.example.com"), mock.patch.object(config, "CERT_PROXY_SECRET", "s" * 32):
+            emails.process_pending()
+        self.assertIn(f"https://portal.example.com/certificado?store_id={published['store_id']}&type=fiscal&competence=2026-09", queue()[0]["body"])
+        self.assertIn("computador que tem o certificado digital da loja", queue()[0]["body"])
 
     def test_redirect_replaces_every_real_address(self):
         self.publish()

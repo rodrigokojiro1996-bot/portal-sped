@@ -12,9 +12,15 @@ Mudanças do Portal Fiscal por versão. Detalhes técnicos em [docs/versao-1.6.m
   - Ao iniciar, o portal retoma até 20 avisos com menos de 48 h. O botão **Reprocessar pendentes** processa até 25 por clique. Depois de 5 tentativas, o aviso espera uma pessoa.
   - `PORTAL_EMAIL_REDIRECIONAR` troca todos os destinatários; preenchido com um valor inválido, o aviso dá erro em vez de usar o endereço real.
 - Migração `005`: tabelas `store_contacts` e `email_notifications`.
+- **Entrada pelo certificado digital da loja** (`/certificado`, ligada por `PORTAL_CERTIFICADO_SEGREDO`). O link do aviso abre a página da loja quando os 8 primeiros dígitos do CNPJ do certificado são os da loja. A sessão só consulta e baixa.
+  - O servidor HTTPS da frente confere a cadeia e a revogação; o portal lê o CNPJ e a validade. Sem o segredo desse servidor, a rota recusa o acesso.
+  - As recusas do portal explicam o que fazer. Quem perde a sessão entra de novo sozinho e volta à página do link, e **Sair** tem tela própria.
+  - `python app.py conferir-certificado ARQUIVO.cer` mostra o que o portal lê de um certificado.
+- `PORTAL_ATRAS_DE_PROXY=1`: o limite de tentativas de login e o monitoramento usam o endereço real de quem acessa, vindo do `X-Forwarded-For`.
 
 ### Corrigido
 - Se a gravação da publicação falhasse com erro do banco, o arquivo ficava na pasta `documentos/` sem registro.
+- Nomes longos de loja na lateral invadiam a área de conteúdo.
 
 ## 1.6.0 — 2026-10-20
 

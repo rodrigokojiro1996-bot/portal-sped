@@ -9,7 +9,7 @@ from portal.handler import PortalHandler
 STORE_A_CNPJ, STORE_B_CNPJ, UNREGISTERED_CNPJ = "11222333000181", "11444777000161", "45543915000181"
 
 # O .env da máquina não vale nos testes: quem precisa da fila de e-mails a liga explicitamente.
-config.EMAIL_ENABLED, config.EMAIL_REDIRECT, config.PUBLIC_URL = False, "", ""
+config.EMAIL_ENABLED, config.EMAIL_REDIRECT, config.PUBLIC_URL, config.CERT_PROXY_SECRET, config.BEHIND_PROXY = False, "", "", "", False
 
 
 def restore_storage():

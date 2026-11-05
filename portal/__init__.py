@@ -11,6 +11,7 @@ Módulos:
     backup       cópia de segurança do banco, dos documentos e do segredo
     contatos     contatos dos avisos de publicação, importados de planilha
     emails       fila de saída dos avisos de publicação (modo de teste, sem envio real)
+    certificado  entrada pelo certificado digital da loja
     views/       HTML das páginas
     handler      rotas HTTP
     cli          linha de comando (python app.py ...)
