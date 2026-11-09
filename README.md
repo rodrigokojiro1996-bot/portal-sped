@@ -27,7 +27,8 @@ portal-sped/
 │   ├── auditoria.py       monitoramento do suporte (desligado)
 │   ├── backup.py          cópia de segurança
 │   ├── contatos.py        contatos dos avisos, importados de planilha
-│   ├── emails.py          fila de avisos de publicação (modo de teste)
+│   ├── emails.py          fila de avisos de publicação
+│   ├── envio.py           envio pela API do Resend
 │   ├── certificado.py     entrada pelo certificado digital da loja
 │   ├── acessos.py         registro de entradas, recusas e downloads por certificado
 │   ├── views/             HTML das páginas
@@ -127,7 +128,7 @@ A tarefa do portal não tem limite de tempo de execução e também roda na bate
 
 ### Rota de saúde
 
-`GET /saude` responde sem login. Com o banco respondendo e na migração esperada, devolve `200` e `{"ok": true, "versao": "1.6.0", "migracao": 7}`; senão, `503` com `{"ok": false, "erro": "..."}` (o detalhe técnico fica só no log). É o que o `iniciar-portal.bat` e o `status` usam para saber se o portal está no ar de verdade.
+`GET /saude` responde sem login. Com o banco respondendo e na migração esperada, devolve `200` e `{"ok": true, "versao": "1.6.0", "migracao": 8}`; senão, `503` com `{"ok": false, "erro": "..."}` (o detalhe técnico fica só no log). É o que o `iniciar-portal.bat` e o `status` usam para saber se o portal está no ar de verdade.
 
 ## Publicar um SPED
 
@@ -177,9 +178,9 @@ O painel mostra os meses até dezembro/2026 (ajustável por `PORTAL_PREVISAO_ATE
 
 A regra vale para o SPED Fiscal e o SPED Contribuições. Os dias úteis descontam fins de semana, feriados nacionais, Carnaval e Sexta-feira Santa. Feriados estaduais e municipais não são considerados.
 
-## Avisos de publicação por e-mail (modo de teste)
+## Avisos de publicação por e-mail
 
-**Nesta versão nenhum e-mail sai do portal.** O código não tem chamada de rede: a fila monta cada aviso e o registra para conferência. Ela vem desligada; para ligar, use `PORTAL_EMAIL=1` no `.env` e reinicie o portal.
+A fila vem desligada; para ligar, use `PORTAL_EMAIL=1` no `.env` e reinicie o portal. Ligada, ela funciona em **modo de teste**: monta cada aviso e o registra para conferência, sem enviar nada. O envio de verdade, pelo [Resend](https://resend.com), tem uma chave própria (veja **Envio real**).
 
 ### Contatos
 
@@ -201,10 +202,37 @@ A administração acompanha tudo em **E-mails**, na barra lateral:
 | Situação | O que significa |
 | --- | --- |
 | Pendente | Ainda não foi processado. |
-| Teste | Montado e registrado. É final: um aviso de teste nunca vira e-mail de verdade. |
-| Erro | Não foi montado; o motivo aparece na tela. Tenta de novo até 5 vezes e depois espera uma pessoa. |
+| Teste | Montado e registrado no modo de teste. É final: um aviso de teste nunca vira e-mail de verdade. |
+| Enviado | Saiu pelo Resend; a tela mostra o id da mensagem, para achá-la no painel dele. |
+| Erro | Não foi montado ou não saiu; o motivo aparece na tela. Tenta de novo até 5 vezes e depois espera uma pessoa. |
 
-Ao iniciar, o portal retoma até 20 avisos com menos de 48 horas. O botão **Reprocessar pendentes** processa até 25 por clique, sem limite de idade.
+Ao iniciar, o portal retoma até 20 avisos com menos de 48 horas. O botão **Reprocessar pendentes** processa até 25 por clique, sem limite de idade. **Ver como e-mail** abre a prévia do aviso numa página isolada, sem scripts.
+
+### Envio real
+
+```env
+PORTAL_EMAIL=1
+PORTAL_EMAIL_ENVIO_REAL=1
+RESEND_API_KEY=re_...                          # chave do painel do Resend, com permissão só de envio
+PORTAL_EMAIL_REDIRECIONAR=voce@example.com     # enquanto testa: todo aviso vai só para este endereço
+# PORTAL_EMAIL_REMETENTE=Portal Fiscal <avisos@seu-dominio>   # depois de verificar o domínio no Resend
+```
+
+- **Proteção na inicialização:** o portal se recusa a iniciar com o envio real ligado se faltar alguma destas peças:
+  - a fila ligada (`PORTAL_EMAIL=1`);
+  - a chave do Resend;
+  - um destino seguro: `PORTAL_EMAIL_REDIRECIONAR` com um endereço válido, para testar, ou `PORTAL_EMAIL_PARA_LOJAS=1`, para enviar às lojas de verdade.
+- **Remetente:** sem domínio verificado, o remetente padrão `onboarding@resend.dev` só entrega para o e-mail dono da conta do Resend. Para as lojas, verifique um domínio (SPF e DKIM) e preencha `PORTAL_EMAIL_REMETENTE`.
+- **Sem duplicar:** cada aviso tem uma chave anti-duplicação, gravada junto com ele. Com ela, tentar de novo não manda o e-mail duas vezes. O Resend guarda essa chave por 24 h desde o primeiro uso.
+  - **Sem confirmação do Resend** quer dizer que o e-mail pode já ter saído: a resposta se perdeu, o Resend falhou no meio ou aceitou sem dizer o id. A fila tenta de novo com a mesma chave.
+  - **Sem conexão com o Resend** (nome não encontrado ou conexão recusada) quer dizer que nada chegou lá. Não conta como "pode ter saído".
+  - Um aviso sem confirmação que passou de 23 h não é reenviado sozinho. Um aviso sem confirmação que depois teve o conteúdo alterado também não.
+  - Nesses casos, o botão diz **Conferi no Resend: reenviar**, e a tela pede para conferir no painel do Resend antes. O reenvio usa uma chave nova e pode duplicar.
+- **Avisos antigos:** um aviso com mais de 7 dias que nunca chegou ao Resend não sai sozinho, para que ligar o envio real não despeje nas lojas avisos de semanas atrás. Ele espera **Reenviar este aviso**. Um aviso que já foi tentado continua com a regra das 23 h.
+- **Modo de teste depois do envio real:** um aviso que pode já ter saído fica como está. Ele não vira "Teste", porque isso diria que nada foi enviado.
+- **Botão Reprocessar pendentes:** roda em segundo plano. A tela não fica presa esperando o Resend.
+- **Erros passageiros:** o portal espera e tenta de novo nos limites de envio e nas falhas do Resend. Nos demais erros, a tela mostra só o tipo do erro, porque a mensagem do Resend pode repetir endereços.
+- **Ritmo:** no máximo 4 envios por segundo, abaixo do limite de 10 do Resend.
 
 ## Entrada pelo certificado digital
 
@@ -321,6 +349,10 @@ As variáveis podem ser definidas no ambiente ou num arquivo `.env` na raiz (cop
 | `PORTAL_MONITORAMENTO` | `0` | Use `1` para reativar o monitoramento do suporte. |
 | `PORTAL_PREVISAO_ATE` | `2026-12` | Último mês (`AAAA-MM`) mostrado na previsão de publicação. |
 | `PORTAL_EMAIL` | `0` | Use `1` para ligar a fila de avisos, em modo de teste. |
+| `PORTAL_EMAIL_ENVIO_REAL` | `0` | Use `1` para os avisos saírem pelo Resend (veja **Envio real**). |
+| `RESEND_API_KEY` | — | Chave da API do Resend. Obrigatória com o envio real. |
+| `PORTAL_EMAIL_REMETENTE` | `Portal Fiscal <onboarding@resend.dev>` | Remetente dos avisos. O padrão só entrega para o dono da conta do Resend. |
+| `PORTAL_EMAIL_PARA_LOJAS` | `0` | Use `1` para o envio real ir aos contatos das lojas, sem redirecionamento. |
 | `PORTAL_EMAIL_REDIRECIONAR` | — | Troca todo destinatário por estes endereços. Valor inválido faz o aviso dar erro, nunca usar o endereço real. |
 | `PORTAL_URL_PUBLICA` | — | Endereço do link do aviso: o que pede o certificado digital. Vazio, o aviso sai sem link. |
 | `PORTAL_CERTIFICADO_SEGREDO` | — | Segredo do servidor HTTPS da frente, com pelo menos 32 caracteres e sem acentos. Vazio, a entrada por certificado fica desligada. |
@@ -357,6 +389,6 @@ Rode sempre pelo `discover`, a partir da pasta do projeto (os testes importam aj
 | `test_cli.py` | checagem de inicialização, `.env` e rota `/saude` |
 | `test_handler.py` | telas e rotas: perfis, matriz e filiais, pop-up, monitoramento |
 | `test_contatos.py` | leitura da planilha, separação de destinatários e cópias, comando de importação |
-| `test_emails.py` | fila de avisos: publicação, modo de teste, travas, varredura e tela |
+| `test_emails.py` | fila de avisos: publicação, modo de teste, envio real com o Resend simulado, HTML, travas, varredura e tela |
 | `test_certificado.py` | leitura do certificado, entrada pelo link, segredo do servidor da frente e endereço real |
 | `test_acessos.py` | registro de entradas, recusas e downloads, filtros, tela e exportação |

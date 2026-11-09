@@ -43,6 +43,25 @@ class StartupCheckTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2, value)
             self.assertIn("PORTAL_CERTIFICADO_SEGREDO inválido", result.stderr)
 
+    def test_real_sending_without_key_or_without_a_safe_destination_does_not_start(self):
+        # Cada caso declara PORTAL_EMAIL: o .env da máquina não pode decidir o resultado do teste.
+        base = {"PORTAL_EMAIL": "1", "PORTAL_EMAIL_ENVIO_REAL": "1"}
+        cases = ({**base, "PORTAL_EMAIL_REDIRECIONAR": "voce@example.com"}, "precisa de RESEND_API_KEY"), \
+                ({**base, "RESEND_API_KEY": "re_teste"}, "precisa de PORTAL_EMAIL_REDIRECIONAR"), \
+                ({**base, "RESEND_API_KEY": "re_teste", "PORTAL_EMAIL_REDIRECIONAR": "voce(arroba)example"}, "não tem nenhum endereço de e-mail válido"), \
+                ({**base, "PORTAL_EMAIL": "0", "RESEND_API_KEY": "re_teste", "PORTAL_EMAIL_REDIRECIONAR": "voce@example.com"}, "precisa de PORTAL_EMAIL=1")
+        for env, message in cases:
+            with tempfile.TemporaryDirectory() as folder:
+                result = run_portal("gerar-resumos", PORTAL_DATA_DIR=folder, **env)
+            self.assertEqual(result.returncode, 2, env)
+            self.assertIn(message, result.stderr)
+
+    def test_real_sending_starts_with_key_and_redirect_or_explicit_release(self):
+        for env in ({"PORTAL_EMAIL_REDIRECIONAR": "voce@example.com"}, {"PORTAL_EMAIL_PARA_LOJAS": "1"}):
+            with tempfile.TemporaryDirectory() as folder:
+                result = run_portal("gerar-resumos", PORTAL_DATA_DIR=folder, PORTAL_EMAIL="1", PORTAL_EMAIL_ENVIO_REAL="1", RESEND_API_KEY="re_teste", **env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_data_folder_that_cannot_be_created_stops_the_portal(self):
         with tempfile.TemporaryDirectory() as folder:
             blocker = Path(folder) / "arquivo-no-lugar-da-pasta"

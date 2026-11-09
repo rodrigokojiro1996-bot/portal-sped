@@ -68,8 +68,10 @@ class PortalHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        replaced = {key.lower() for key in headers or {}}
         for key, value in SECURITY_HEADERS.items():
-            self.send_header(key, value)
+            if key.lower() not in replaced:  # quem chama pode trocar um deles, como a política de segurança da prévia do e-mail
+                self.send_header(key, value)
         if getattr(self, "session_cookie", None):
             self.send_header("Set-Cookie", session_cookie_header(self.session_cookie))
         for key, value in (headers or {}).items():
@@ -229,11 +231,13 @@ class PortalHandler(BaseHTTPRequestHandler):
                 self.monitoring_export()
             else:
                 self.monitoring_page(user)
-        elif config.EMAIL_ENABLED and path == "/emails":
+        elif config.EMAIL_ENABLED and path in ("/emails", "/emails/previa"):
             if user["role"] != "admin":
                 self.send_message(HTTPStatus.FORBIDDEN, "Acesso negado", "Área restrita à administração.", user)
-            else:
+            elif path == "/emails":
                 self.emails_page(user)
+            else:
+                self.email_preview(user)
         elif config.CERT_PROXY_SECRET and path in ("/acessos", "/acessos.csv"):
             if user["role"] != "admin":
                 self.send_message(HTTPStatus.FORBIDDEN, "Acesso negado", "Área restrita à administração.", user)
@@ -419,6 +423,14 @@ class PortalHandler(BaseHTTPRequestHandler):
         content = "<div class='workspace'>" + painel.sidebar(user, stores, None, "fiscal", section="emails") + "<main class='workspace-main'>" + main + "</main></div>"
         self.send_page(HTTPStatus.OK, "Fila de e-mails", content, user)
 
+    def email_preview(self, user: sqlite3.Row) -> None:
+        """O aviso como o programa de e-mail mostra. Página isolada: sem script, sem acesso ao portal e só com os estilos do próprio e-mail."""
+        page = emails.preview_html(self.query().get("id", [""])[0])
+        if page is None:
+            self.send_message(HTTPStatus.NOT_FOUND, "Página não encontrada", "Aviso sem prévia.", user)
+            return
+        self.send_bytes(HTTPStatus.OK, page.encode("utf-8"), headers={"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src https: data:; sandbox"})
+
     def access_filters(self) -> tuple[str, str]:
         query = self.query()
         period = query.get("periodo", [acessos.DEFAULT_PERIOD])[0]
@@ -499,7 +511,16 @@ class PortalHandler(BaseHTTPRequestHandler):
         elif user and user["role"] == "admin" and path == "/upload":
             self.upload(data)
         elif user and user["role"] == "admin" and config.EMAIL_ENABLED and path == "/emails/reprocessar":
-            self.redirect(f"/emails?processados={sum(emails.process_pending().values())}")
+            # Em segundo plano: no envio real, cada aviso espera o Resend, e a tela não pode ficar presa nisso.
+            emails.process_in_background()
+            self.redirect("/emails?processados=fila")
+        elif user and user["role"] == "admin" and config.EMAIL_ENABLED and config.EMAIL_SEND and path == "/emails/reenviar":
+            notice_id = data.get("id", "")
+            if isinstance(notice_id, str) and emails.confirm_resend(notice_id):
+                emails.process_in_background()
+                self.redirect("/emails?processados=reenvio")
+            else:
+                self.redirect("/emails")
         else:
             attempted = {"/upload": "publicar um arquivo SPED", "/stores": "cadastrar uma loja"}.get(path, f"uma ação não permitida ({path})")
             self.audit(user, "acao_bloqueada", detail=attempted)
