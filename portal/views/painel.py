@@ -63,6 +63,9 @@ def sidebar(user: sqlite3.Row, stores: list[sqlite3.Row], selected_store: sqlite
     if admin and config.EMAIL_ENABLED:
         tools += (f"<a class='sped-tab{CURRENT if section == 'emails' else ''}' href='/emails'><span class='tab-mark'>{icon('mail')}</span>"
                   "<span class='tab-text'>E-mails<small>Fila de avisos</small></span></a>")
+    if admin and config.CERT_PROXY_SECRET:
+        tools += (f"<a class='sped-tab{CURRENT if section == 'acessos' else ''}' href='/acessos'><span class='tab-mark'>{icon('lock')}</span>"
+                  "<span class='tab-text'>Acessos<small>Entradas por certificado</small></span></a>")
     if tools:
         navigation += f"<nav class='sped-navigation' aria-label='Administração'><span class='side-section-label'>ADMINISTRAÇÃO</span>{tools}</nav>"
     return f"<aside class='workspace-sidebar'><div class='side-overline'>PORTAL DA REDE</div>{card}{branches}{navigation}<div class='side-bottom'><span class='secure-dot'></span> Acesso protegido</div></aside>"

@@ -19,7 +19,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import resumo_sped
-from portal import auditoria, certificado, config, emails
+from portal import acessos, auditoria, certificado, config, emails
 from portal import db as storage
 from portal.auth import STAFF_ROLES, create_user, token_hash, verify_password
 from portal.calendario import competence_timeline
@@ -28,6 +28,8 @@ from portal.publicacao import competence_summary, publish_sped
 from portal.sped import DOCUMENT_TYPES, PublishError, format_cnpj, normalize_cnpj
 from portal.views import painel
 from portal.views.acesso import certificate_exit, certificate_refused, login_page
+from portal.views.acessos import LIMIT as ACCESS_LIMIT
+from portal.views.acessos import access_csv, access_main
 from portal.views.dialogos import publish_dialog, published_dialog
 from portal.views.emails import emails_main
 from portal.views.layout import message_page, page_heading, render_page
@@ -232,6 +234,13 @@ class PortalHandler(BaseHTTPRequestHandler):
                 self.send_message(HTTPStatus.FORBIDDEN, "Acesso negado", "Área restrita à administração.", user)
             else:
                 self.emails_page(user)
+        elif config.CERT_PROXY_SECRET and path in ("/acessos", "/acessos.csv"):
+            if user["role"] != "admin":
+                self.send_message(HTTPStatus.FORBIDDEN, "Acesso negado", "Área restrita à administração.", user)
+            elif path.endswith(".csv"):
+                self.access_export()
+            else:
+                self.access_page(user)
         else:
             self.send_message(HTTPStatus.NOT_FOUND, "Página não encontrada", "Página não encontrada", user)
 
@@ -239,8 +248,8 @@ class PortalHandler(BaseHTTPRequestHandler):
         """Entrada pelo link do aviso: o certificado da loja abre uma sessão de consulta, sem senha.
 
         A sessão é da loja e só consulta e baixa. Não encerra as outras sessões da loja, como o login por senha faz:
-        o mesmo certificado pode estar com a loja e com a contabilidade ao mesmo tempo. Quem já tem sessão da raiz
-        do link segue com ela, sem precisar do certificado de novo.
+        o mesmo certificado pode estar com a loja e com a contabilidade ao mesmo tempo. Quem já entrou por certificado
+        na raiz do link segue com a sessão; quem tem sessão de senha entra pelo certificado, para o acesso ficar registrado.
         """
         if not self.trusted_proxy():
             self.send_message(HTTPStatus.FORBIDDEN, "Acesso negado", "Acesso negado.")
@@ -249,13 +258,19 @@ class PortalHandler(BaseHTTPRequestHandler):
         requested = query.get("store_id", [""])[0]
         target = certificado.destination(requested, query.get("type", [""])[0], query.get("competence", [""])[0])
         user = self.get_user()
-        if user and user["role"] == "store" and (not requested or requested in {str(store["id"]) for store in certificado.stores_of(user["cnpj"])}):
+        if (user and user["role"] == "store" and acessos.certificate_session(token_hash(self.session_cookie))
+                and (not requested or requested in {str(store["id"]) for store in certificado.stores_of(user["cnpj"])})):
             self.redirect(target)
             return
+        header, agent = self.headers.get(certificado.CERT_HEADER, ""), self.headers.get("User-Agent", "")
+        certificate = None
         try:
-            certificate = certificado.read_header(self.headers.get(certificado.CERT_HEADER, ""))
+            certificate = certificado.read_header(header)
+            certificado.check_validity(certificate)
             store = certificado.session_store(certificate.cnpj, requested)
         except certificado.CertificateError as error:
+            if header:
+                acessos.record_refusal(certificate, error.serial, str(error), requested, self.client_ip(), agent)
             self.send_page(HTTPStatus.FORBIDDEN, "Certificado não aceito", certificate_refused(str(error)))
             return
         now = int(time.time())
@@ -263,6 +278,8 @@ class PortalHandler(BaseHTTPRequestHandler):
         with connect() as db:
             db.execute("DELETE FROM sessions WHERE user_id=? AND expires_at<=?", (store["id"], now))
             db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (token_hash(raw_token), store["id"], secrets.token_urlsafe(24), now + config.SESSION_SECONDS))
+            opened = next((item for item in certificado.stores_of(certificate.cnpj) if str(item["id"]) == requested), store)
+            acessos.record_entry(db, certificate, opened, token_hash(raw_token), self.client_ip(), agent)
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", target)
         self.send_header("Set-Cookie", session_cookie_header(raw_token))
@@ -400,6 +417,25 @@ class PortalHandler(BaseHTTPRequestHandler):
         content = "<div class='workspace'>" + painel.sidebar(user, stores, None, "fiscal", section="emails") + "<main class='workspace-main'>" + main + "</main></div>"
         self.send_page(HTTPStatus.OK, "Fila de e-mails", content, user)
 
+    def access_filters(self) -> tuple[str, str]:
+        query = self.query()
+        period = query.get("periodo", [acessos.DEFAULT_PERIOD])[0]
+        return query.get("loja", [""])[0], period if period in auditoria.AUDIT_PERIODS else acessos.DEFAULT_PERIOD
+
+    def access_page(self, user: sqlite3.Row) -> None:
+        """Quem entrou pelo certificado, o que baixou e o que foi recusado."""
+        store_filter, period = self.access_filters()
+        with connect() as db:
+            stores = db.execute("SELECT id, cnpj, name FROM users WHERE role='store' AND active=1 ORDER BY name").fetchall()
+            everyone = db.execute("SELECT id, name FROM users WHERE role='store' ORDER BY name").fetchall()  # loja desativada também tem histórico
+        main = access_main(everyone, acessos.entries(store_filter, period, limit=ACCESS_LIMIT + 1), store_filter, period)
+        content = "<div class='workspace'>" + painel.sidebar(user, stores, None, "fiscal", section="acessos") + "<main class='workspace-main'>" + main + "</main></div>"
+        self.send_page(HTTPStatus.OK, "Acessos por certificado", content, user)
+
+    def access_export(self) -> None:
+        body = access_csv(acessos.entries(*self.access_filters()))
+        self.send_bytes(HTTPStatus.OK, body, "text/csv; charset=utf-8", {"Content-Disposition": f'attachment; filename="acessos-certificado-{date.today():%Y-%m-%d}.csv"'})
+
     def monitoring_export(self) -> None:
         user_filter, period, category = self.monitoring_filters()
         body = monitoring_csv(auditoria.audit_entries(user_filter, period, category, limit=None))
@@ -422,6 +458,9 @@ class PortalHandler(BaseHTTPRequestHandler):
             # Registra antes de enviar: o download nunca deixa de constar no histórico.
             store = {"id": document["store_id"], "name": document["store_name"], "cnpj": document["store_cnpj"]}
             self.audit(user, "baixou_arquivo", store, document["document_type"], document["competence"], file_name=document["original_name"])
+        if user["role"] == "store":
+            # Também antes de enviar: se o registro falhar, o arquivo não sai sem rastro.
+            acessos.record_download(token_hash(self.session_cookie), document, self.client_ip(), self.headers.get("User-Agent", ""))
         self.send_bytes(HTTPStatus.OK, body, "text/plain; charset=utf-8", {"Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "private, no-store"})
 
     # ------------------------------------------------------------------ POST

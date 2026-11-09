@@ -16,6 +16,8 @@ Mudanças do Portal Fiscal por versão. Detalhes técnicos em [docs/versao-1.6.m
   - O servidor HTTPS da frente confere a cadeia e a revogação; o portal lê o CNPJ e a validade. Sem o segredo desse servidor, a rota recusa o acesso.
   - As recusas do portal explicam o que fazer. Quem perde a sessão entra de novo sozinho e volta à página do link, e **Sair** tem tela própria.
   - `python app.py conferir-certificado ARQUIVO.cer` mostra o que o portal lê de um certificado.
+- **Registro de acessos por certificado** (tela **Acessos**, com filtros e exportação para Excel). Guarda entradas, recusas e downloads, com o CNPJ e o número de série do certificado, sem o CPF do responsável. Nenhum acesso por certificado acontece sem registro.
+- Migração `006`: tabela `certificate_access`.
 - `PORTAL_ATRAS_DE_PROXY=1`: o limite de tentativas de login e o monitoramento usam o endereço real de quem acessa, vindo do `X-Forwarded-For`.
 
 ### Corrigido

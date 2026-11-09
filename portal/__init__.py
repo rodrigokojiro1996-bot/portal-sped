@@ -12,6 +12,7 @@ Módulos:
     contatos     contatos dos avisos de publicação, importados de planilha
     emails       fila de saída dos avisos de publicação (modo de teste, sem envio real)
     certificado  entrada pelo certificado digital da loja
+    acessos      registro de entradas, recusas e downloads por certificado
     views/       HTML das páginas
     handler      rotas HTTP
     cli          linha de comando (python app.py ...)
