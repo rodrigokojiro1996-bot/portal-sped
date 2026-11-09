@@ -10,7 +10,8 @@ Módulos:
     auditoria    monitoramento do suporte (desligado por padrão)
     backup       cópia de segurança do banco, dos documentos e do segredo
     contatos     contatos dos avisos de publicação, importados de planilha
-    emails       fila de saída dos avisos de publicação (modo de teste, sem envio real)
+    emails       fila de saída dos avisos de publicação
+    envio        envio de um e-mail pela API do Resend
     certificado  entrada pelo certificado digital da loja
     acessos      registro de entradas, recusas e downloads por certificado
     views/       HTML das páginas

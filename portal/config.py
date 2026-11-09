@@ -6,6 +6,7 @@ O que já estiver definido no ambiente tem prioridade sobre o .env.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -62,6 +63,22 @@ EMAIL_ENABLED = os.environ.get("PORTAL_EMAIL", "0") == "1"
 EMAIL_REDIRECT = os.environ.get("PORTAL_EMAIL_REDIRECIONAR", "").strip()
 # Endereço público do portal. Vazio, o aviso sai sem link.
 PUBLIC_URL = os.environ.get("PORTAL_URL_PUBLICA", "").strip().rstrip("/")
+
+# Envio real pelo Resend: DESLIGADO por padrão. Desligado, a fila continua em modo de teste e nada sai do portal.
+EMAIL_SEND = os.environ.get("PORTAL_EMAIL_ENVIO_REAL", "0") == "1"
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
+# Sem domínio verificado no Resend, este remetente só entrega para o e-mail dono da conta.
+EMAIL_FROM = os.environ.get("PORTAL_EMAIL_REMETENTE", "").strip() or "Portal Fiscal <onboarding@resend.dev>"
+# 1 = os avisos vão para os contatos reais das lojas. Sem isto, o envio real só é aceito com PORTAL_EMAIL_REDIRECIONAR.
+EMAIL_TO_STORES = os.environ.get("PORTAL_EMAIL_PARA_LOJAS", "0") == "1"
+if EMAIL_SEND and not EMAIL_ENABLED:
+    PROBLEMS.append("PORTAL_EMAIL_ENVIO_REAL=1 precisa de PORTAL_EMAIL=1: sem a fila ligada, nada seria enviado.")
+if EMAIL_SEND and EMAIL_REDIRECT and not re.search(r"[^\s@,;]+@[^\s@,;]+\.[A-Za-z]{2,}", EMAIL_REDIRECT):
+    PROBLEMS.append("PORTAL_EMAIL_REDIRECIONAR não tem nenhum endereço de e-mail válido.")
+if EMAIL_SEND and not RESEND_API_KEY:
+    PROBLEMS.append("PORTAL_EMAIL_ENVIO_REAL=1 precisa de RESEND_API_KEY.")
+if EMAIL_SEND and not EMAIL_REDIRECT and not EMAIL_TO_STORES:
+    PROBLEMS.append("PORTAL_EMAIL_ENVIO_REAL=1 precisa de PORTAL_EMAIL_REDIRECIONAR (para testar) ou de PORTAL_EMAIL_PARA_LOJAS=1 (para enviar às lojas).")
 
 # Entrada pelo certificado digital: DESLIGADA enquanto não houver segredo. É o valor que o servidor HTTPS da frente
 # manda em toda requisição, e é ele que dá ao portal o direito de confiar no certificado repassado.
