@@ -29,6 +29,7 @@ portal-sped/
 │   ├── contatos.py        contatos dos avisos, importados de planilha
 │   ├── emails.py          fila de avisos de publicação (modo de teste)
 │   ├── certificado.py     entrada pelo certificado digital da loja
+│   ├── acessos.py         registro de entradas, recusas e downloads por certificado
 │   ├── views/             HTML das páginas
 │   ├── handler.py         rotas HTTP
 │   └── cli.py             comandos de linha
@@ -126,7 +127,7 @@ A tarefa do portal não tem limite de tempo de execução e também roda na bate
 
 ### Rota de saúde
 
-`GET /saude` responde sem login. Com o banco respondendo e na migração esperada, devolve `200` e `{"ok": true, "versao": "1.6.0", "migracao": 5}`; senão, `503` com `{"ok": false, "erro": "..."}` (o detalhe técnico fica só no log). É o que o `iniciar-portal.bat` e o `status` usam para saber se o portal está no ar de verdade.
+`GET /saude` responde sem login. Com o banco respondendo e na migração esperada, devolve `200` e `{"ok": true, "versao": "1.6.0", "migracao": 6}`; senão, `503` com `{"ok": false, "erro": "..."}` (o detalhe técnico fica só no log). É o que o `iniciar-portal.bat` e o `status` usam para saber se o portal está no ar de verdade.
 
 ## Publicar um SPED
 
@@ -253,6 +254,18 @@ server {
 }
 ```
 
+### Registro de acessos
+
+Com a entrada ligada, a administração acompanha em **Acessos**, na barra lateral, quem entrou pelo certificado, o que baixou e o que foi recusado. Dá para filtrar por loja e período e exportar para Excel.
+
+- **Sem acesso por certificado fora do registro:** a entrada é gravada junto com a sessão, e o download é registrado antes de o arquivo sair. Se o registro falhar, o acesso também falha. Quem tem sessão de senha e abre o link do aviso entra pelo certificado, para o acesso ficar registrado.
+- **Recusas:** ficam na loja do link ou, sem link, na loja do certificado. A mesma recusa repetida em menos de 1 minuto conta uma vez.
+- **O que fica guardado:** data, CNPJ e número de série do certificado, loja, arquivo, motivo da recusa, IP e navegador. O CPF do responsável, que também vem no e-CNPJ, não é guardado.
+- **O que não aparece:** visitas sem certificado, que não identificam ninguém, e downloads de quem entrou com senha.
+- **Endereço real:** o IP só é o de quem acessa com `PORTAL_ATRAS_DE_PROXY=1`.
+
+IP e navegador são dados pessoais. O registro ainda não tem prazo de retenção: nada é apagado automaticamente.
+
 ### Conferir um certificado
 
 Para ver o que o portal lê de um certificado, exporte **só a parte pública** (`.cer` ou `.pem`, nunca o `.pfx`):
@@ -345,3 +358,4 @@ Rode sempre pelo `discover`, a partir da pasta do projeto (os testes importam aj
 | `test_contatos.py` | leitura da planilha, separação de destinatários e cópias, comando de importação |
 | `test_emails.py` | fila de avisos: publicação, modo de teste, travas, varredura e tela |
 | `test_certificado.py` | leitura do certificado, entrada pelo link, segredo do servidor da frente e endereço real |
+| `test_acessos.py` | registro de entradas, recusas e downloads, filtros, tela e exportação |

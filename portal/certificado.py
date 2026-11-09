@@ -42,12 +42,17 @@ OTHER_STORE = "Este certificado não pertence à loja deste link. Use o certific
 
 
 class CertificateError(ValueError):
-    """Certificado recusado, com a explicação mostrada a quem tentou entrar."""
+    """Certificado recusado, com a explicação mostrada a quem tentou entrar e o número de série, se deu para ler."""
+
+    def __init__(self, message: str, serial: str | None = None) -> None:
+        super().__init__(message)
+        self.serial = serial
 
 
 @dataclass(frozen=True)
 class Certificate:
     cnpj: str
+    serial: str
     not_before: datetime
     not_after: datetime
 
@@ -112,7 +117,9 @@ def parse_der(der: bytes) -> Certificate:
         if tag != SEQUENCE:
             raise CertificateError(UNREADABLE)
         tbs = _children(_children(body)[0][1])
-        validity = _children(tbs[(1 if tbs[0][0] == CONTEXT_0 else 0) + 3][1])
+        first = 1 if tbs[0][0] == CONTEXT_0 else 0  # a versão é opcional
+        serial = tbs[first][1].lstrip(b"\x00").hex().upper() or "00"  # sem o byte de sinal, como o openssl e o nginx mostram
+        validity = _children(tbs[first + 3][1])
         not_before, not_after = _moment(*validity[0]), _moment(*validity[1])
         cnpj = _cnpj(next((value for tag, value in tbs if tag == CONTEXT_3), b""))
     except CertificateError:
@@ -120,10 +127,10 @@ def parse_der(der: bytes) -> Certificate:
     except (IndexError, ValueError) as error:
         raise CertificateError(UNREADABLE) from error
     if not cnpj:
-        raise CertificateError(NO_CNPJ)
+        raise CertificateError(NO_CNPJ, serial)
     if not valid_cnpj(cnpj):
-        raise CertificateError(UNREADABLE)
-    return Certificate(cnpj, not_before, not_after)
+        raise CertificateError(UNREADABLE, serial)
+    return Certificate(cnpj, serial, not_before, not_after)
 
 
 def _decode(text: str) -> bytes:
@@ -144,13 +151,14 @@ def check_validity(certificate: Certificate, now: datetime | None = None) -> Non
         raise CertificateError(EXPIRED)
 
 
-def read_header(value: str, now: datetime | None = None) -> Certificate:
-    """Certificado repassado pelo servidor da frente, em PEM com escape de URL ou em base64."""
+def read_header(value: str) -> Certificate:
+    """Certificado repassado pelo servidor da frente, em PEM com escape de URL ou em base64.
+
+    Não confere a validade: quem chama confere depois, para o registro saber de quem era um certificado vencido.
+    """
     if not value:
         raise CertificateError(NO_CERTIFICATE)
-    certificate = parse_der(_decode(unquote(value)))
-    check_validity(certificate, now)
-    return certificate
+    return parse_der(_decode(unquote(value)))
 
 
 def read_file(path: Path) -> Certificate:

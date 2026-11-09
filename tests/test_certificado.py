@@ -34,7 +34,7 @@ def other_name(oid, value, tag=PRINTABLE):
     return der(0xA0, der(0x06, oid), der(0xA0, der(tag, value)))
 
 
-def build_certificate(cnpj=STORE_A_CNPJ, not_before=b"260101000000Z", not_after=b"360101000000Z", time_tag=0x17, value_tag=PRINTABLE, with_version=True, names=None):
+def build_certificate(cnpj=STORE_A_CNPJ, not_before=b"260101000000Z", not_after=b"360101000000Z", time_tag=0x17, value_tag=PRINTABLE, with_version=True, names=None, serial=b"\x01"):
     """Certificado X.509 mínimo com a mesma estrutura de um e-CNPJ. A assinatura é falsa: o portal não a confere."""
     if names is None:
         names = [other_name(OID_RESPONSIBLE, b"01011980" + b"1" * 30), other_name(certificado.OID_CNPJ, cnpj.encode(), value_tag), der(0x81, b"loja@example.com")]
@@ -43,7 +43,7 @@ def build_certificate(cnpj=STORE_A_CNPJ, not_before=b"260101000000Z", not_after=
     algorithm = der(0x30, der(0x06, bytes.fromhex("2A864886F70D01010B")), der(0x05))
     name = der(0x30, der(0x31, der(0x30, der(0x06, bytes.fromhex("550403")), der(UTF8, b"Teste"))))
     version = [der(0xA0, der(0x02, b"\x02"))] if with_version else []
-    tbs = der(0x30, *version, der(0x02, b"\x01"), algorithm, name, der(0x30, der(time_tag, not_before), der(time_tag, not_after)), name, der(0x30, algorithm, der(0x03, b"\x00")), extensions)
+    tbs = der(0x30, *version, der(0x02, serial), algorithm, name, der(0x30, der(time_tag, not_before), der(time_tag, not_after)), name, der(0x30, algorithm, der(0x03, b"\x00")), extensions)
     return der(0x30, tbs, algorithm, der(0x03, b"\x00\x01\x02"))
 
 
@@ -120,27 +120,40 @@ class HeaderTests(unittest.TestCase):
     now = datetime(2027, 6, 1, tzinfo=timezone.utc)
 
     def test_reads_url_escaped_pem(self):
-        self.assertEqual(certificado.read_header(as_header(build_certificate()), self.now).cnpj, STORE_A_CNPJ)
+        self.assertEqual(certificado.read_header(as_header(build_certificate())).cnpj, STORE_A_CNPJ)
 
     def test_reads_plain_base64_and_keeps_the_first_of_a_chain(self):
         leaf, other = (base64.b64encode(item).decode() for item in (build_certificate(), build_certificate(cnpj=STORE_B_CNPJ)))
-        self.assertEqual(certificado.read_header(leaf, self.now).cnpj, STORE_A_CNPJ)
-        self.assertEqual(certificado.read_header(f"{leaf},{other}", self.now).cnpj, STORE_A_CNPJ)
+        self.assertEqual(certificado.read_header(leaf).cnpj, STORE_A_CNPJ)
+        self.assertEqual(certificado.read_header(f"{leaf},{other}").cnpj, STORE_A_CNPJ)
 
     def test_keeps_the_first_of_a_pem_chain(self):
         chain = as_pem(build_certificate()) + as_pem(build_certificate(cnpj=STORE_B_CNPJ))
-        self.assertEqual(certificado.read_header(quote(chain, safe=""), self.now).cnpj, STORE_A_CNPJ)
+        self.assertEqual(certificado.read_header(quote(chain, safe="")).cnpj, STORE_A_CNPJ)
 
     def test_expired_and_future_certificates_are_refused(self):
         with self.assertRaisesRegex(certificado.CertificateError, "vencido"):
-            certificado.read_header(as_header(build_certificate(not_after=b"270101000000Z")), self.now)
+            certificado.check_validity(certificado.read_header(as_header(build_certificate(not_after=b"270101000000Z"))), self.now)
         with self.assertRaisesRegex(certificado.CertificateError, "ainda não está valendo"):
-            certificado.read_header(as_header(build_certificate(not_before=b"280101000000Z")), self.now)
+            certificado.check_validity(certificado.read_header(as_header(build_certificate(not_before=b"280101000000Z"))), self.now)
+
+    def test_reads_the_serial_number(self):
+        self.assertEqual(certificado.read_header(as_header(build_certificate())).serial, "01")
+        self.assertEqual(certificado.read_header(as_header(build_certificate(with_version=False))).serial, "01")
+
+    def test_serial_is_shown_without_the_sign_byte_like_openssl_and_nginx(self):
+        self.assertEqual(certificado.read_header(as_header(build_certificate(serial=b"\x00\xab\x12"))).serial, "AB12")
+        self.assertEqual(certificado.read_header(as_header(build_certificate(serial=b"\x00"))).serial, "00")
+
+    def test_refused_certificate_keeps_the_serial_for_the_record(self):
+        with self.assertRaises(certificado.CertificateError) as refused:
+            certificado.read_header(as_header(build_certificate(names=[other_name(OID_CPF, b"0101198012345678901")], serial=b"\x7f")))
+        self.assertEqual(refused.exception.serial, "7F")
 
     def test_empty_and_invalid_values_are_refused(self):
         for value in ("", "!!!não é base64!!!", "A" * 20000):
             with self.assertRaises(certificado.CertificateError):
-                certificado.read_header(value, self.now)
+                certificado.read_header(value)
 
 
 class DestinationTests(unittest.TestCase):
