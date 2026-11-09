@@ -73,7 +73,9 @@ def build_message(document: sqlite3.Row) -> tuple[str, str]:
     lines = ["Olá,", "", f"O arquivo {sped_label(document['document_type'])} da loja {document['store_name']} (CNPJ {format_cnpj(document['store_cnpj'])}) foi publicado no Portal Fiscal.",
              "", f"Competência: {month}" + (f" (período parcial de {period})" if period else ""), f"Arquivo: {document['original_name']}"]
     if config.PUBLIC_URL:
-        lines += ["", "Para consultar:", f"{config.PUBLIC_URL}/dashboard?store_id={document['store_id']}&type={document['document_type']}&competence={document['competence']}"]
+        page = "certificado" if config.CERT_PROXY_SECRET else "dashboard"
+        intro = "Para consultar, abra este link no computador que tem o certificado digital da loja:" if config.CERT_PROXY_SECRET else "Para consultar:"
+        lines += ["", intro, f"{config.PUBLIC_URL}/{page}?store_id={document['store_id']}&type={document['document_type']}&competence={document['competence']}"]
     return subject, "\n".join(lines + ["", "Mensagem automática do Portal Fiscal das Farmácias Associadas."])
 
 

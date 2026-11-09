@@ -36,6 +36,13 @@ class StartupCheckTests(unittest.TestCase):
         self.assertIn("O Portal Fiscal não pode iniciar", result.stderr)
         self.assertIn("PORTAL_PORT inválida: 'porta'", result.stderr)
 
+    def test_weak_certificate_secret_stops_with_clear_message(self):
+        for value in ("curto", "com-acento-ç-" + "x" * 32):
+            with tempfile.TemporaryDirectory() as folder:
+                result = run_portal("gerar-resumos", PORTAL_CERTIFICADO_SEGREDO=value, PORTAL_DATA_DIR=folder)
+            self.assertEqual(result.returncode, 2, value)
+            self.assertIn("PORTAL_CERTIFICADO_SEGREDO inválido", result.stderr)
+
     def test_data_folder_that_cannot_be_created_stops_the_portal(self):
         with tempfile.TemporaryDirectory() as folder:
             blocker = Path(folder) / "arquivo-no-lugar-da-pasta"

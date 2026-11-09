@@ -63,6 +63,15 @@ EMAIL_REDIRECT = os.environ.get("PORTAL_EMAIL_REDIRECIONAR", "").strip()
 # Endereço público do portal. Vazio, o aviso sai sem link.
 PUBLIC_URL = os.environ.get("PORTAL_URL_PUBLICA", "").strip().rstrip("/")
 
+# Entrada pelo certificado digital: DESLIGADA enquanto não houver segredo. É o valor que o servidor HTTPS da frente
+# manda em toda requisição, e é ele que dá ao portal o direito de confiar no certificado repassado.
+CERT_PROXY_SECRET = os.environ.get("PORTAL_CERTIFICADO_SEGREDO", "").strip()
+if CERT_PROXY_SECRET and (len(CERT_PROXY_SECRET) < 32 or not CERT_PROXY_SECRET.isascii()):
+    PROBLEMS.append("PORTAL_CERTIFICADO_SEGREDO inválido. Use pelo menos 32 caracteres aleatórios, sem acentos.")
+# 1 = o portal só é alcançado por um proxy, e o endereço real de quem acessa vem no X-Forwarded-For.
+# É uma confiança separada do segredo acima: acreditar num endereço não pode dar direito a entrar como loja.
+BEHIND_PROXY = os.environ.get("PORTAL_ATRAS_DE_PROXY", "0") == "1"
+
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024
 SESSION_SECONDS = 8 * 60 * 60
 LOGIN_FORM_SECONDS = 2 * 60 * 60

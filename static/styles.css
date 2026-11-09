@@ -68,7 +68,7 @@ a{color:inherit;text-decoration:none}
 /* Barra lateral: loja aberta, lojas do grupo e tipo de arquivo */
 .side-store-mark .icon{width:15px;height:15px}
 .store-picker label{font-weight:600}
-.branch-nav{display:grid;gap:8px}.branch-list{display:grid;gap:3px}
+.branch-nav{display:grid;gap:8px}.branch-list{display:grid;grid-template-columns:minmax(0,1fr);gap:3px}
 .branch-link{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:36px;padding:0 10px;border:1px solid transparent;border-radius:5px;color:#40514e;font-size:12px;font-weight:600}
 .branch-link span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.branch-link small{flex:none;font-size:10px;font-weight:500;color:#8a9895;font-variant-numeric:tabular-nums}
 .branch-link:hover{background:#f3f8f7}.branch-link.active{background:#e5f7f4;border-color:#bce8e2;color:#075e59}.branch-link.active small{color:#3d7f77}
@@ -96,6 +96,10 @@ a{color:inherit;text-decoration:none}
 .audit-what{display:flex;align-items:flex-start;gap:10px;min-width:280px;white-space:normal}.audit-what>span:last-child{min-width:0;overflow-wrap:anywhere}
 .audit-badge{flex:none;display:inline-flex;align-items:center;height:22px;padding:0 8px;border-radius:99px;font-size:10px;font-weight:700;letter-spacing:.3px}
 .badge-acessos{background:#e5f7f4;color:#075e59}.badge-consultas{background:#eef2f1;color:#3e5653}.badge-downloads{background:var(--green-deep);color:#fff}.badge-alertas{background:#fdecea;color:#a53b34}
+.entry-page{display:grid;place-items:center;min-height:calc(100vh - 128px);padding:24px 16px}
+.entry-card{width:min(520px,100%);padding:30px 28px;border:1px solid var(--line);border-radius:10px;background:#fff}.entry-card h1{margin:14px 0 8px;font-size:22px;line-height:1.25}.entry-card p{margin:0;line-height:1.55}
+.entry-mark{display:inline-grid;place-items:center;width:42px;height:42px;border-radius:50%;background:#e5f7f4;color:var(--green-deep)}.entry-mark .icon{width:22px;height:22px}
+.entry-steps{margin:16px 0 0;padding-left:18px;font-size:13px;line-height:1.55;color:#40514e}.entry-steps li+li{margin-top:8px}.entry-card .btn{margin-top:18px}
 .email-subject{margin:8px 0 4px;font-size:11px;font-weight:700;white-space:normal}.email-body{margin:0;padding:10px;border-radius:8px;background:#f5f8f7;font-family:inherit;font-size:11px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}
 
 /* Previsão de publicação e ajuda "?" */

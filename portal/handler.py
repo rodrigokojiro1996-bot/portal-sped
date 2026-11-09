@@ -19,7 +19,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import resumo_sped
-from portal import auditoria, config, emails
+from portal import auditoria, certificado, config, emails
 from portal import db as storage
 from portal.auth import STAFF_ROLES, create_user, token_hash, verify_password
 from portal.calendario import competence_timeline
@@ -27,7 +27,7 @@ from portal.db import connect, ensure_secret
 from portal.publicacao import competence_summary, publish_sped
 from portal.sped import DOCUMENT_TYPES, PublishError, format_cnpj, normalize_cnpj
 from portal.views import painel
-from portal.views.acesso import login_page
+from portal.views.acesso import certificate_exit, certificate_refused, login_page
 from portal.views.dialogos import publish_dialog, published_dialog
 from portal.views.emails import emails_main
 from portal.views.layout import message_page, page_heading, render_page
@@ -49,6 +49,10 @@ SECURITY_HEADERS = {
 }
 
 
+def session_cookie_header(token: str) -> str:
+    return f"portal_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={config.SESSION_SECONDS}" + ("; Secure" if config.COOKIE_SECURE else "")
+
+
 class PortalHandler(BaseHTTPRequestHandler):
     server_version = "PortalFiscal"
     sys_version = ""
@@ -65,7 +69,7 @@ class PortalHandler(BaseHTTPRequestHandler):
         for key, value in SECURITY_HEADERS.items():
             self.send_header(key, value)
         if getattr(self, "session_cookie", None):
-            self.send_header("Set-Cookie", f"portal_session={self.session_cookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age={config.SESSION_SECONDS}" + ("; Secure" if config.COOKIE_SECURE else ""))
+            self.send_header("Set-Cookie", session_cookie_header(self.session_cookie))
         for key, value in (headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -153,7 +157,27 @@ class PortalHandler(BaseHTTPRequestHandler):
 
     def audit(self, user: sqlite3.Row | dict | None, action: str, store: sqlite3.Row | dict | None = None, document_type: str | None = None,
               competence: str | None = None, file_name: str | None = None, detail: str | None = None) -> None:
-        auditoria.record(user, action, self.client_address[0], self.headers.get("User-Agent", ""), store, document_type, competence, file_name, detail)
+        auditoria.record(user, action, self.client_ip(), self.headers.get("User-Agent", ""), store, document_type, competence, file_name, detail)
+
+    def trusted_proxy(self) -> bool:
+        """A requisição veio do servidor HTTPS da frente: só ele conhece o segredo."""
+        return bool(config.CERT_PROXY_SECRET) and hmac.compare_digest(self.headers.get(certificado.PROXY_HEADER, "").encode(), config.CERT_PROXY_SECRET.encode())
+
+    def on_certificate_address(self) -> bool:
+        """Chegou pelo endereço que pede o certificado, e o navegador apresentou um. Quem está aqui não tem senha."""
+        return self.trusted_proxy() and bool(self.headers.get(certificado.CERT_HEADER))
+
+    def sign_in_path(self, path: str) -> str:
+        """Para onde vai quem está sem sessão. Com certificado, entra de novo sozinho e volta à página pedida."""
+        if not self.on_certificate_address():
+            return "/login"
+        query = urlparse(self.path).query
+        return "/certificado" + (f"?{query}" if path == "/dashboard" and query else "")
+
+    def client_ip(self) -> str:
+        """Endereço de quem acessa. Atrás de um proxy, a conexão vem dele e o endereço real é o último do X-Forwarded-For."""
+        forwarded = self.headers.get("X-Forwarded-For", "").split(",")[-1].strip() if config.BEHIND_PROXY else ""
+        return forwarded or self.client_address[0]
 
     def query(self) -> dict[str, list[str]]:
         return parse_qs(urlparse(self.path).query)
@@ -169,15 +193,27 @@ class PortalHandler(BaseHTTPRequestHandler):
         if path == "/saude":
             self.health()
             return
+        if config.CERT_PROXY_SECRET and path == "/certificado":
+            self.certificate_entry()
+            return
         if path in ("/", "/login"):
             if self.get_user():
                 self.redirect("/dashboard")
-            else:
+            elif not self.on_certificate_address():
                 self.send_login_page()
+            elif "saiu" in self.query():
+                self.send_page(HTTPStatus.OK, "Você saiu", certificate_exit())
+            else:
+                self.redirect("/certificado")
             return
         user = self.get_user()
         if not user:
-            self.redirect("/login")
+            # Só o que uma pessoa abre leva à entrada: pedidos automáticos do navegador, como /favicon.ico,
+            # abririam uma sessão sozinhos, inclusive logo depois de "Sair".
+            if path == "/dashboard" or path.startswith("/download/") or not self.on_certificate_address():
+                self.redirect(self.sign_in_path(path))
+            else:
+                self.send_message(HTTPStatus.NOT_FOUND, "Página não encontrada", "Página não encontrada")
             return
         if path == "/dashboard":
             self.dashboard_workspace(user)
@@ -198,6 +234,39 @@ class PortalHandler(BaseHTTPRequestHandler):
                 self.emails_page(user)
         else:
             self.send_message(HTTPStatus.NOT_FOUND, "Página não encontrada", "Página não encontrada", user)
+
+    def certificate_entry(self) -> None:
+        """Entrada pelo link do aviso: o certificado da loja abre uma sessão de consulta, sem senha.
+
+        A sessão é da loja e só consulta e baixa. Não encerra as outras sessões da loja, como o login por senha faz:
+        o mesmo certificado pode estar com a loja e com a contabilidade ao mesmo tempo. Quem já tem sessão da raiz
+        do link segue com ela, sem precisar do certificado de novo.
+        """
+        if not self.trusted_proxy():
+            self.send_message(HTTPStatus.FORBIDDEN, "Acesso negado", "Acesso negado.")
+            return
+        query = self.query()
+        requested = query.get("store_id", [""])[0]
+        target = certificado.destination(requested, query.get("type", [""])[0], query.get("competence", [""])[0])
+        user = self.get_user()
+        if user and user["role"] == "store" and (not requested or requested in {str(store["id"]) for store in certificado.stores_of(user["cnpj"])}):
+            self.redirect(target)
+            return
+        try:
+            certificate = certificado.read_header(self.headers.get(certificado.CERT_HEADER, ""))
+            store = certificado.session_store(certificate.cnpj, requested)
+        except certificado.CertificateError as error:
+            self.send_page(HTTPStatus.FORBIDDEN, "Certificado não aceito", certificate_refused(str(error)))
+            return
+        now = int(time.time())
+        raw_token = secrets.token_urlsafe(32)
+        with connect() as db:
+            db.execute("DELETE FROM sessions WHERE user_id=? AND expires_at<=?", (store["id"], now))
+            db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (token_hash(raw_token), store["id"], secrets.token_urlsafe(24), now + config.SESSION_SECONDS))
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", target)
+        self.send_header("Set-Cookie", session_cookie_header(raw_token))
+        self.end_headers()
 
     def health(self) -> None:
         """Rota de saúde, sem login: o banco responde e está na versão de migração que este código espera.
@@ -381,7 +450,7 @@ class PortalHandler(BaseHTTPRequestHandler):
                 db.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash(self.session_cookie),))
             self.session_cookie = None
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/login")
+            self.send_header("Location", "/login?saiu=1" if self.on_certificate_address() else "/login")
             self.send_header("Set-Cookie", "portal_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
             self.end_headers()
         elif user and user["role"] == "admin" and path == "/stores":
@@ -396,7 +465,7 @@ class PortalHandler(BaseHTTPRequestHandler):
             self.send_message(HTTPStatus.FORBIDDEN, "Acesso negado", "Ação não autorizada.", user)
 
     def login(self, data: dict[str, str | bytes]) -> None:
-        ip = self.client_address[0]
+        ip = self.client_ip()
         now = int(time.time())
         with connect() as db:
             attempt = db.execute("SELECT attempts, window_start FROM login_attempts WHERE ip=?", (ip,)).fetchone()
@@ -426,7 +495,7 @@ class PortalHandler(BaseHTTPRequestHandler):
         self.session_cookie = raw_token
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", "/dashboard")
-        self.send_header("Set-Cookie", f"portal_session={raw_token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={config.SESSION_SECONDS}" + ("; Secure" if config.COOKIE_SECURE else ""))
+        self.send_header("Set-Cookie", session_cookie_header(raw_token))
         self.send_header("Set-Cookie", "login_nonce=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
         self.end_headers()
 

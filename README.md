@@ -28,6 +28,7 @@ portal-sped/
 │   ├── backup.py          cópia de segurança
 │   ├── contatos.py        contatos dos avisos, importados de planilha
 │   ├── emails.py          fila de avisos de publicação (modo de teste)
+│   ├── certificado.py     entrada pelo certificado digital da loja
 │   ├── views/             HTML das páginas
 │   ├── handler.py         rotas HTTP
 │   └── cli.py             comandos de linha
@@ -69,6 +70,7 @@ Cada instalação deve criar seu próprio administrador e cadastrar suas lojas. 
 | `python app.py gerar-resumos` | Recalcula os resumos fiscais dos arquivos publicados. |
 | `python app.py backup [--destino PASTA] [--manter DIAS]` | Faz um backup conferido (veja **Backup**). |
 | `python app.py importar-contatos ARQUIVO.xlsx [--aplicar]` | Lê os contatos dos avisos (veja **Avisos de publicação**). |
+| `python app.py conferir-certificado ARQUIVO.cer` | Mostra o CNPJ, a validade e as lojas de um certificado (veja **Entrada pelo certificado digital**). |
 
 ## Perfis de acesso
 
@@ -203,6 +205,62 @@ A administração acompanha tudo em **E-mails**, na barra lateral:
 
 Ao iniciar, o portal retoma até 20 avisos com menos de 48 horas. O botão **Reprocessar pendentes** processa até 25 por clique, sem limite de idade.
 
+## Entrada pelo certificado digital
+
+O link do aviso abre a página da loja sem senha: quem clica prova que pertence à loja com o **certificado digital dela** (e-CNPJ da ICP-Brasil). O portal compara os 8 primeiros dígitos do CNPJ gravado no certificado com os da loja do link, a mesma regra de matriz e filiais. Por isso o certificado de uma filial abre também a matriz e as outras filiais da mesma raiz. Grupos com mais de uma raiz precisam de um certificado para cada uma.
+
+A sessão aberta assim é da loja: só consulta e baixa. Certificado de pessoa física (e-CPF) é recusado, porque não traz CNPJ. As recusas feitas pelo portal explicam o que fazer. Certificado vencido, revogado ou de fora da ICP-Brasil é barrado antes, pelo servidor da frente: para essas pessoas verem uma explicação, esse servidor precisa de uma página de erro própria.
+
+Nesse endereço não existe senha. Quem perde a sessão entra de novo sozinho e volta à página pedida. Ao clicar em **Sair**, a pessoa vê uma tela de saída, com o aviso de fechar o navegador em computador compartilhado: enquanto ele estiver aberto, o certificado continua disponível.
+
+### Quem faz o quê
+
+| Quem | Responsabilidade |
+| --- | --- |
+| Servidor HTTPS da frente | Pede o certificado ao navegador, confere a cadeia da ICP-Brasil e a revogação, repassa o certificado e manda o segredo. |
+| Portal | Confere o segredo, lê o CNPJ e a validade e decide qual loja abre. |
+
+**O portal não confere a assinatura do certificado nem se ele foi revogado.** Essa parte é do servidor da frente, e sem ela a entrada não é segura. A rota `/certificado` só existe com `PORTAL_CERTIFICADO_SEGREDO` preenchido, e recusa qualquer requisição sem esse segredo: sem ele, bastaria inventar um cabeçalho para entrar como qualquer loja.
+
+### Requisitos do servidor da frente
+
+- Usar um endereço só para esta entrada, que peça o certificado em toda conexão, e apontar `PORTAL_URL_PUBLICA` para ele.
+- Aceitar apenas a cadeia da ICP-Brasil e conferir a revogação, mantendo a lista atualizada.
+- Recusar certificado inválido, mas deixar chegar ao portal a requisição **sem** certificado: é o portal que explica o que fazer, com uma página melhor que o erro do navegador.
+- Sobrescrever `X-Client-Cert`, `X-Portal-Proxy` e `X-Forwarded-For`, sem nunca repassar os valores enviados pelo cliente.
+- Mandar o segredo **só neste endereço**. Qualquer outro endereço com o segredo permitiria inventar um certificado e entrar como qualquer loja.
+- Manter o portal inacessível por outro caminho (`PORTAL_HOST=127.0.0.1`) e usar `COOKIE_SECURE=1` e `PORTAL_ATRAS_DE_PROXY=1`.
+
+Exemplo em nginx, **ainda não testado**:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name certificado.example.com;
+    ssl_certificate         /etc/nginx/portal.crt;
+    ssl_certificate_key     /etc/nginx/portal.key;
+    ssl_client_certificate  /etc/nginx/icp-brasil.pem;
+    ssl_crl                 /etc/nginx/icp-brasil.crl;
+    ssl_verify_client       optional;
+    ssl_verify_depth        4;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header X-Client-Cert   $ssl_client_escaped_cert;
+        proxy_set_header X-Portal-Proxy  "o mesmo valor de PORTAL_CERTIFICADO_SEGREDO";
+        proxy_set_header X-Forwarded-For $remote_addr;
+    }
+}
+```
+
+### Conferir um certificado
+
+Para ver o que o portal lê de um certificado, exporte **só a parte pública** (`.cer` ou `.pem`, nunca o `.pfx`):
+
+```powershell
+python app.py conferir-certificado loja.cer
+```
+
 ## Dados locais
 
 Por padrão, banco, segredo de sessão e arquivos ficam em `data/`:
@@ -250,7 +308,9 @@ As variáveis podem ser definidas no ambiente ou num arquivo `.env` na raiz (cop
 | `PORTAL_PREVISAO_ATE` | `2026-12` | Último mês (`AAAA-MM`) mostrado na previsão de publicação. |
 | `PORTAL_EMAIL` | `0` | Use `1` para ligar a fila de avisos, em modo de teste. |
 | `PORTAL_EMAIL_REDIRECIONAR` | — | Troca todo destinatário por estes endereços. Valor inválido faz o aviso dar erro, nunca usar o endereço real. |
-| `PORTAL_URL_PUBLICA` | — | Endereço público usado no link do aviso. Vazio, o aviso sai sem link. |
+| `PORTAL_URL_PUBLICA` | — | Endereço do link do aviso: o que pede o certificado digital. Vazio, o aviso sai sem link. |
+| `PORTAL_CERTIFICADO_SEGREDO` | — | Segredo do servidor HTTPS da frente, com pelo menos 32 caracteres e sem acentos. Vazio, a entrada por certificado fica desligada. |
+| `PORTAL_ATRAS_DE_PROXY` | `0` | Use `1` só com o portal inacessível por fora do proxy: o limite de login passa a usar o endereço real, vindo do `X-Forwarded-For`. |
 | `PORTAL_PYTHON` | — | Caminho do Python usado pelos `.bat` (as tarefas do Windows gravam sozinhas). |
 
 O proxy deve forçar HTTPS, não deve ser acessível por HTTP público e precisa encaminhar para o serviço local. Configure limites de corpo de requisição compatíveis com o limite de 40 MB. Restrinja também o acesso administrativo e os backups. O servidor HTTP embutido no Python é destinado a desenvolvimento/uso local, não a servir tráfego público em produção. O portal ainda não possui recuperação de senha, autenticação multifator ou integração de identidade; estabeleça esses controles e obtenha revisão técnica antes de disponibilizar dados fiscais reais.
@@ -284,3 +344,4 @@ Rode sempre pelo `discover`, a partir da pasta do projeto (os testes importam aj
 | `test_handler.py` | telas e rotas: perfis, matriz e filiais, pop-up, monitoramento |
 | `test_contatos.py` | leitura da planilha, separação de destinatários e cópias, comando de importação |
 | `test_emails.py` | fila de avisos: publicação, modo de teste, travas, varredura e tela |
+| `test_certificado.py` | leitura do certificado, entrada pelo link, segredo do servidor da frente e endereço real |

@@ -1,7 +1,44 @@
-"""Tela de acesso (login)."""
+"""Telas de acesso: login e entrada pelo certificado digital."""
 from __future__ import annotations
 
-from portal.views.layout import h
+from portal import certificado
+from portal.views.layout import h, icon
+
+CHOOSE_AGAIN = "Feche todas as janelas do navegador, abra o link do e-mail de novo e escolha o certificado da loja. O navegador guarda a escolha enquanto está aberto."
+TALK_TO_SUPPORT = "Se o problema continuar, fale com a equipe das Farmácias Associadas."
+
+# Para cada recusa: título e o que a pessoa pode fazer. Quem lê é a loja ou a contabilidade, não a equipe técnica.
+REFUSALS = {
+    certificado.NO_CERTIFICATE: ("Nenhum certificado recebido", [
+        "Use o computador em que o certificado da loja está instalado. No celular, o link normalmente não funciona.",
+        "Se o certificado for token ou cartão, conecte-o antes de abrir o link.",
+        "Quando o navegador pedir, escolha o certificado da loja. Se já tiver cancelado, feche todas as janelas do navegador e abra o link de novo."]),
+    certificado.OTHER_STORE: ("Certificado de outra loja", [CHOOSE_AGAIN, TALK_TO_SUPPORT]),
+    certificado.NO_CNPJ: ("Certificado de pessoa física", [CHOOSE_AGAIN, TALK_TO_SUPPORT]),
+    certificado.EXPIRED: ("Certificado vencido", ["Renove o certificado com a certificadora da loja.", "Se a loja já tem um certificado novo, instale-o neste computador. " + CHOOSE_AGAIN]),
+    certificado.NOT_YET_VALID: ("Certificado ainda não vale", ["Confira se a data e a hora deste computador estão certas.", TALK_TO_SUPPORT]),
+    certificado.NO_STORE: ("Loja não encontrada", ["Confira se o certificado é da loja certa. " + CHOOSE_AGAIN, TALK_TO_SUPPORT]),
+    certificado.UNREADABLE: ("Certificado não reconhecido", [CHOOSE_AGAIN, TALK_TO_SUPPORT]),
+}
+
+
+def entry_card(mark: str, title: str, text: str, steps: list[str], action: str = "") -> str:
+    items = "".join(f"<li>{h(step)}</li>" for step in steps)
+    return (f"<main class='entry-page'><section class='entry-card'><span class='entry-mark'>{icon(mark)}</span><h1>{h(title)}</h1><p>{h(text)}</p>"
+            f"{f'<ul class=entry-steps>{items}</ul>' if items else ''}{action}</section></main>")
+
+
+def certificate_refused(message: str) -> str:
+    """Recusa da entrada por certificado: o que aconteceu e o que fazer."""
+    title, steps = REFUSALS[message]
+    return entry_card("lock", title, message, steps)
+
+
+def certificate_exit() -> str:
+    """Saída de quem entrou por certificado. Sem esta tela, a entrada automática desfaria o "Sair"."""
+    action = f"<a class='btn btn-outline' href='/certificado'>{icon('arrow')}<span>Entrar de novo</span></a>"
+    return entry_card("lock", "Você saiu do portal", "Sua sessão foi encerrada.",
+                      ["Em computador compartilhado, feche todas as janelas do navegador. Enquanto ele estiver aberto, o certificado continua disponível para entrar de novo."], action)
 
 
 def login_page(csrf: str, message: str = "", credential: str = "") -> str:
