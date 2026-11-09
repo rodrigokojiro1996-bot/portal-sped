@@ -1,6 +1,7 @@
 import csv
 import http.client
 import io
+import socket
 import sqlite3
 import time
 import unittest
@@ -30,6 +31,12 @@ class AccessCase(unittest.TestCase):
             patcher = mock.patch.object(config, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # Os testes nunca consultam o DNS de verdade: os IPs de exemplo não têm nome reverso, e a espera deixaria tudo lento.
+        self.lookup = mock.patch.object(acessos, "_lookup", return_value="")
+        self.lookup.start()
+        self.addCleanup(self.lookup.stop)
+        acessos._hostnames.clear()
+        self.addCleanup(acessos._hostnames.clear)
         auth.create_user(STORE_A_CNPJ, "Loja Centro", "store", "senha-da-loja-123")
         auth.create_user(STORE_B_CNPJ, "Outra Rede", "store", "senha-da-loja-123")
         auth.create_user(None, "Admin Exemplo", "admin", "senha-admin-123", "admin.teste")
@@ -165,6 +172,141 @@ class RecordTests(AccessCase):
     def test_failure_in_the_record_does_not_hide_the_refusal(self):
         with mock.patch.object(acessos, "_insert", side_effect=sqlite3.OperationalError("disco cheio")), mock.patch("sys.stderr"):
             self.assertEqual(self.enter(build_certificate(not_after=b"250101000000Z"))[0], 403)
+
+
+class HostnameTests(AccessCase):
+    def use_dns(self, names, addresses):
+        """DNS simulado: names é o reverso de cada IP, addresses é o que cada nome devolve na ida."""
+        self.lookup.stop()
+        real_getaddrinfo = socket.getaddrinfo  # o cliente HTTP do teste também resolve nomes: o resto passa direto
+
+        def reverse_dns(ip):
+            if ip not in names:
+                raise OSError("sem nome reverso")
+            return names[ip], [], [ip]
+
+        def forward_dns(name, *args):
+            if name in addresses:
+                return [(2, 1, 6, "", (ip, 0)) for ip in addresses[name]]
+            if name.endswith(".example.net") or name.endswith(".example.gov"):
+                raise OSError("nome desconhecido")
+            return real_getaddrinfo(name, *args)
+
+        for patcher in (mock.patch("socket.gethostbyaddr", side_effect=reverse_dns), mock.patch("socket.getaddrinfo", side_effect=forward_dns)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_confirmed_reverse_name_is_recorded_on_entry_refusal_and_download(self):
+        self.use_dns({"203.0.113.7": "Cliente-77.Operadora.example.net"}, {"cliente-77.operadora.example.net": ["203.0.113.7"]})
+        published = publicacao.publish_sped(sped(FISCAL_SAMPLE), "sped.txt")
+        _, cookie = self.enter(build_certificate())
+        self.get(f"/download/{published['id']}", {"Cookie": cookie, "X-Forwarded-For": "203.0.113.7"})
+        self.enter(build_certificate(not_after=b"250101000000Z"))
+        self.assertEqual([(entry["event"], entry["hostname"]) for entry in records()],
+                         [("entrou", "cliente-77.operadora.example.net"), ("baixou", "cliente-77.operadora.example.net"), ("recusado", "cliente-77.operadora.example.net")])
+
+    def test_name_that_does_not_point_back_is_marked_unconfirmed(self):
+        self.use_dns({"203.0.113.7": "banco.example.gov"}, {"banco.example.gov": ["198.51.100.1"]})
+        self.enter(build_certificate())
+        self.assertEqual(records()[0]["hostname"], "banco.example.gov (não confirmado)")
+
+    def test_name_that_does_not_resolve_back_is_marked_unconfirmed_and_not_dropped(self):
+        self.use_dns({"203.0.113.7": "banco.example.gov"}, {})
+        self.enter(build_certificate())
+        self.assertEqual(records()[0]["hostname"], "banco.example.gov (não confirmado)")
+
+    def test_ipv6_and_mapped_ipv4_written_differently_still_confirm(self):
+        self.use_dns({"2001:DB8::7": "v6.example.net", "::ffff:203.0.113.7": "v4.example.net"}, {"v6.example.net": ["2001:db8::7"], "v4.example.net": ["203.0.113.7"]})
+        self.assertEqual(acessos.hostname_of("2001:DB8::7"), "v6.example.net")
+        self.assertEqual(acessos.hostname_of("::ffff:203.0.113.7"), "v4.example.net")
+
+    def test_loopback_in_any_form_and_invalid_addresses_are_never_looked_up(self):
+        self.lookup.stop()
+        with mock.patch.object(acessos, "_lookup") as lookup:
+            for value in ("127.0.0.1", "127.0.0.2", "::1", "::ffff:127.0.0.1", "0.0.0.0", "", "nao-e-ip"):
+                self.assertEqual(acessos.hostname_of(value), "", value)
+        lookup.assert_not_called()
+
+    def test_failure_is_retried_after_a_while_and_names_expire(self):
+        self.lookup.stop()
+        clock = [1000.0]
+        with mock.patch.object(acessos.time, "monotonic", side_effect=lambda: clock[0]), mock.patch.object(acessos, "_lookup", side_effect=["", "cliente.example.net", "outro.example.net"]) as lookup:
+            self.assertEqual(acessos.hostname_of("203.0.113.7"), "")
+            clock[0] += acessos.FAILURE_TTL - 1
+            self.assertEqual(acessos.hostname_of("203.0.113.7"), "")
+            clock[0] += 2
+            self.assertEqual(acessos.hostname_of("203.0.113.7"), "cliente.example.net")
+            clock[0] += acessos.NAME_TTL + 1
+            self.assertEqual(acessos.hostname_of("203.0.113.7"), "outro.example.net")
+        self.assertEqual(lookup.call_count, 3)
+
+    def test_congested_dns_is_skipped_without_waiting_or_caching(self):
+        self.lookup.stop()
+        full = mock.Mock(acquire=mock.Mock(return_value=False))
+        with mock.patch.object(acessos, "_pending", full), mock.patch.object(acessos, "_lookup") as lookup:
+            self.assertEqual(acessos.hostname_of("203.0.113.7"), "")
+        lookup.assert_not_called()
+        self.assertNotIn("203.0.113.7", acessos._hostnames)
+
+    def test_repeated_refusal_does_not_look_up_the_name_again(self):
+        self.lookup.stop()
+        with mock.patch.object(acessos, "_lookup", return_value="cliente.example.net") as lookup:
+            self.enter(build_certificate(not_after=b"250101000000Z"))
+            acessos._hostnames.clear()
+            self.enter(build_certificate(not_after=b"250101000000Z"))
+        self.assertEqual(lookup.call_count, 1)
+
+    def test_ip_without_reverse_name_is_recorded_empty(self):
+        self.use_dns({}, {})
+        self.assertEqual(self.enter(build_certificate())[0], 303)
+        self.assertEqual(records()[0]["hostname"], "")
+
+    def test_slow_dns_does_not_hold_the_entry(self):
+        self.lookup.stop()
+        with mock.patch.object(acessos, "LOOKUP_SECONDS", 0.2), mock.patch.object(acessos, "_lookup", side_effect=lambda ip: time.sleep(1) or "lento.example.net"):
+            started = time.monotonic()
+            self.assertEqual(self.enter(build_certificate())[0], 303)
+            self.assertLess(time.monotonic() - started, 0.9)
+        self.assertEqual(records()[0]["hostname"], "")
+
+    def test_reverse_name_is_looked_up_before_the_transaction(self):
+        def lookup_that_writes(ip):
+            connection = sqlite3.connect(storage.DATABASE, timeout=0.3)
+            try:
+                connection.execute("BEGIN IMMEDIATE")  # falha se a entrada já estiver com o banco preso
+                connection.rollback()
+            finally:
+                connection.close()
+            return "livre.example.net"
+        self.lookup.stop()
+        with mock.patch.object(acessos, "_lookup", side_effect=lookup_that_writes):
+            self.enter(build_certificate())
+        self.assertEqual(records()[0]["hostname"], "livre.example.net")
+
+    def test_local_connection_is_never_looked_up(self):
+        self.lookup.stop()
+        with mock.patch.object(config, "BEHIND_PROXY", False), mock.patch.object(acessos, "_lookup") as lookup:
+            self.enter(build_certificate())
+        lookup.assert_not_called()
+        self.assertEqual(records()[0]["hostname"], "")
+
+    def test_same_ip_is_looked_up_once(self):
+        self.lookup.stop()
+        with mock.patch.object(acessos, "_lookup", return_value="cliente.example.net") as lookup:
+            self.enter(build_certificate())
+            self.enter(build_certificate(cnpj=STORE_B_CNPJ))
+        self.assertEqual(lookup.call_count, 1)
+
+    def test_reverse_name_is_shown_escaped_and_exported(self):
+        self.lookup.stop()
+        with mock.patch.object(acessos, "_lookup", return_value="=<b>host"):
+            self.enter(build_certificate())
+        page = self.page("admin", "/acessos")[1]
+        self.assertIn("&lt;b&gt;host", page)
+        self.assertNotIn("<b>host", page)
+        csv_text = self.page("admin", "/acessos.csv")[1]
+        self.assertIn("Nome reverso", csv_text)
+        self.assertIn("'=<b>host", csv_text)
 
 
 class DownloadTests(AccessCase):
