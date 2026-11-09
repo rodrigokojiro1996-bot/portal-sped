@@ -19,7 +19,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import resumo_sped
-from portal import auditoria, config
+from portal import auditoria, config, emails
 from portal import db as storage
 from portal.auth import STAFF_ROLES, create_user, token_hash, verify_password
 from portal.calendario import competence_timeline
@@ -29,6 +29,7 @@ from portal.sped import DOCUMENT_TYPES, PublishError, format_cnpj, normalize_cnp
 from portal.views import painel
 from portal.views.acesso import login_page
 from portal.views.dialogos import publish_dialog, published_dialog
+from portal.views.emails import emails_main
 from portal.views.layout import message_page, page_heading, render_page
 from portal.views.monitoramento import monitoring_csv, monitoring_main
 
@@ -190,6 +191,11 @@ class PortalHandler(BaseHTTPRequestHandler):
                 self.monitoring_export()
             else:
                 self.monitoring_page(user)
+        elif config.EMAIL_ENABLED and path == "/emails":
+            if user["role"] != "admin":
+                self.send_message(HTTPStatus.FORBIDDEN, "Acesso negado", "Área restrita à administração.", user)
+            else:
+                self.emails_page(user)
         else:
             self.send_message(HTTPStatus.NOT_FOUND, "Página não encontrada", "Página não encontrada", user)
 
@@ -317,6 +323,14 @@ class PortalHandler(BaseHTTPRequestHandler):
         content = "<div class='workspace'>" + painel.sidebar(user, stores, None, "fiscal", section="monitoramento") + "<main class='workspace-main'>" + main + "</main></div>"
         self.send_page(HTTPStatus.OK, "Monitoramento do suporte", content, user)
 
+    def emails_page(self, user: sqlite3.Row) -> None:
+        """Fila de e-mails: o que cada publicação gerou e em que situação está."""
+        with connect() as db:
+            stores = db.execute("SELECT id, cnpj, name FROM users WHERE role='store' AND active=1 ORDER BY name").fetchall()
+        main = emails_main(emails.queue_entries(), emails.contact_total(), user["csrf_token"], self.query().get("processados", [""])[0])
+        content = "<div class='workspace'>" + painel.sidebar(user, stores, None, "fiscal", section="emails") + "<main class='workspace-main'>" + main + "</main></div>"
+        self.send_page(HTTPStatus.OK, "Fila de e-mails", content, user)
+
     def monitoring_export(self) -> None:
         user_filter, period, category = self.monitoring_filters()
         body = monitoring_csv(auditoria.audit_entries(user_filter, period, category, limit=None))
@@ -374,6 +388,8 @@ class PortalHandler(BaseHTTPRequestHandler):
             self.add_store(data)
         elif user and user["role"] == "admin" and path == "/upload":
             self.upload(data)
+        elif user and user["role"] == "admin" and config.EMAIL_ENABLED and path == "/emails/reprocessar":
+            self.redirect(f"/emails?processados={sum(emails.process_pending().values())}")
         else:
             attempted = {"/upload": "publicar um arquivo SPED", "/stores": "cadastrar uma loja"}.get(path, f"uma ação não permitida ({path})")
             self.audit(user, "acao_bloqueada", detail=attempted)
@@ -435,4 +451,5 @@ class PortalHandler(BaseHTTPRequestHandler):
             self.path = "/dashboard"
             self.dashboard_workspace(self.get_user(), publish_dialog(False, str(error)), HTTPStatus.UNPROCESSABLE_ENTITY)
             return
+        emails.process_in_background()
         self.redirect(f"/dashboard?store_id={published['store_id']}&type={published['document_type']}&competence={published['competence']}&published={published['id']}")

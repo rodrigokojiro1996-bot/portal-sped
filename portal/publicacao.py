@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import resumo_sped
-from portal import config
+from portal import config, emails
 from portal import db as storage
 from portal.db import connect
 from portal.sped import PublishError, detect_sped_type, format_cnpj, parse_sped_header, period_label, sped_label
@@ -49,9 +49,13 @@ def publish_sped(content: bytes, file_name: str) -> dict[str, str | int]:
             db.execute("INSERT INTO documents (id, store_id, document_type, competence, original_name, size, sha256, uploaded_at, period_start, period_end) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                        (doc_id, store["id"], document_type, header["competence"], filename, len(content), hashlib.sha256(content).hexdigest(), datetime.now(timezone.utc).isoformat(),
                         header["period_start"], header["period_end"]))
+            emails.enqueue(db, doc_id, store["cnpj"])
         except sqlite3.IntegrityError as error:
             document_path.unlink(missing_ok=True)
             raise PublishError(f"Este arquivo já está publicado no {label} da loja {store['name']} (CNPJ {format_cnpj(store['cnpj'])}). Nada foi alterado.") from error
+        except sqlite3.Error:
+            document_path.unlink(missing_ok=True)
+            raise
     with connect() as db:
         document = db.execute("SELECT * FROM documents WHERE id=?", (doc_id,)).fetchone()
     document_summary(document)

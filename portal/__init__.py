@@ -9,6 +9,8 @@ Módulos:
     calendario   dias úteis e prazos de publicação
     auditoria    monitoramento do suporte (desligado por padrão)
     backup       cópia de segurança do banco, dos documentos e do segredo
+    contatos     contatos dos avisos de publicação, importados de planilha
+    emails       fila de saída dos avisos de publicação (modo de teste, sem envio real)
     views/       HTML das páginas
     handler      rotas HTTP
     cli          linha de comando (python app.py ...)

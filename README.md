@@ -26,6 +26,8 @@ portal-sped/
 │   ├── calendario.py      dias úteis e prazos de publicação
 │   ├── auditoria.py       monitoramento do suporte (desligado)
 │   ├── backup.py          cópia de segurança
+│   ├── contatos.py        contatos dos avisos, importados de planilha
+│   ├── emails.py          fila de avisos de publicação (modo de teste)
 │   ├── views/             HTML das páginas
 │   ├── handler.py         rotas HTTP
 │   └── cli.py             comandos de linha
@@ -66,6 +68,7 @@ Cada instalação deve criar seu próprio administrador e cadastrar suas lojas. 
 | `python app.py redefinir-senha CNPJ-ou-usuario` | Gera uma senha nova. |
 | `python app.py gerar-resumos` | Recalcula os resumos fiscais dos arquivos publicados. |
 | `python app.py backup [--destino PASTA] [--manter DIAS]` | Faz um backup conferido (veja **Backup**). |
+| `python app.py importar-contatos ARQUIVO.xlsx [--aplicar]` | Lê os contatos dos avisos (veja **Avisos de publicação**). |
 
 ## Perfis de acesso
 
@@ -121,7 +124,7 @@ A tarefa do portal não tem limite de tempo de execução e também roda na bate
 
 ### Rota de saúde
 
-`GET /saude` responde sem login. Com o banco respondendo e na migração esperada, devolve `200` e `{"ok": true, "versao": "1.6.0", "migracao": 4}`; senão, `503` com `{"ok": false, "erro": "..."}` (o detalhe técnico fica só no log). É o que o `iniciar-portal.bat` e o `status` usam para saber se o portal está no ar de verdade.
+`GET /saude` responde sem login. Com o banco respondendo e na migração esperada, devolve `200` e `{"ok": true, "versao": "1.6.0", "migracao": 5}`; senão, `503` com `{"ok": false, "erro": "..."}` (o detalhe técnico fica só no log). É o que o `iniciar-portal.bat` e o `status` usam para saber se o portal está no ar de verdade.
 
 ## Publicar um SPED
 
@@ -171,6 +174,35 @@ O painel mostra os meses até dezembro/2026 (ajustável por `PORTAL_PREVISAO_ATE
 
 A regra vale para o SPED Fiscal e o SPED Contribuições. Os dias úteis descontam fins de semana, feriados nacionais, Carnaval e Sexta-feira Santa. Feriados estaduais e municipais não são considerados.
 
+## Avisos de publicação por e-mail (modo de teste)
+
+**Nesta versão nenhum e-mail sai do portal.** O código não tem chamada de rede: a fila monta cada aviso e o registra para conferência. Ela vem desligada; para ligar, use `PORTAL_EMAIL=1` no `.env` e reinicie o portal.
+
+### Contatos
+
+Os contatos vêm de uma planilha `.xlsx`, com uma linha por loja e as colunas `CNPJ`, `SPED SPA` e `CONTATO` (`Fantasia` é opcional e aparece nos relatórios). Entram as lojas com `SIM` em `SPED SPA` e com e-mail em `CONTATO`. Lojas com "Loja Fechada" em qualquer coluna ficam de fora.
+
+```powershell
+python app.py importar-contatos lojas.xlsx            # mostra o resultado, sem gravar
+python app.py importar-contatos lojas.xlsx --aplicar  # grava
+```
+
+O campo `CONTATO` é texto livre. Vários endereços viram destinatários, e o que vem depois de "com cópia para" vira cópia. Importar de novo atualiza as lojas da planilha e não apaga as demais. O contato é guardado pelo CNPJ e passa a valer quando a loja estiver cadastrada no portal. **A planilha e o banco têm dados reais: não os coloque no repositório.**
+
+### Fila
+
+Ao publicar um arquivo de uma loja com contato, o aviso nasce na mesma transação do documento e é processado em segundo plano, depois da resposta. Loja sem contato não gera aviso. Uma falha na fila nunca atinge quem publicou.
+
+A administração acompanha tudo em **E-mails**, na barra lateral:
+
+| Situação | O que significa |
+| --- | --- |
+| Pendente | Ainda não foi processado. |
+| Teste | Montado e registrado. É final: um aviso de teste nunca vira e-mail de verdade. |
+| Erro | Não foi montado; o motivo aparece na tela. Tenta de novo até 5 vezes e depois espera uma pessoa. |
+
+Ao iniciar, o portal retoma até 20 avisos com menos de 48 horas. O botão **Reprocessar pendentes** processa até 25 por clique, sem limite de idade.
+
 ## Dados locais
 
 Por padrão, banco, segredo de sessão e arquivos ficam em `data/`:
@@ -216,6 +248,9 @@ As variáveis podem ser definidas no ambiente ou num arquivo `.env` na raiz (cop
 | `COOKIE_SECURE` | `0` | Use `1` somente quando HTTPS estiver configurado no proxy reverso. |
 | `PORTAL_MONITORAMENTO` | `0` | Use `1` para reativar o monitoramento do suporte. |
 | `PORTAL_PREVISAO_ATE` | `2026-12` | Último mês (`AAAA-MM`) mostrado na previsão de publicação. |
+| `PORTAL_EMAIL` | `0` | Use `1` para ligar a fila de avisos, em modo de teste. |
+| `PORTAL_EMAIL_REDIRECIONAR` | — | Troca todo destinatário por estes endereços. Valor inválido faz o aviso dar erro, nunca usar o endereço real. |
+| `PORTAL_URL_PUBLICA` | — | Endereço público usado no link do aviso. Vazio, o aviso sai sem link. |
 | `PORTAL_PYTHON` | — | Caminho do Python usado pelos `.bat` (as tarefas do Windows gravam sozinhas). |
 
 O proxy deve forçar HTTPS, não deve ser acessível por HTTP público e precisa encaminhar para o serviço local. Configure limites de corpo de requisição compatíveis com o limite de 40 MB. Restrinja também o acesso administrativo e os backups. O servidor HTTP embutido no Python é destinado a desenvolvimento/uso local, não a servir tráfego público em produção. O portal ainda não possui recuperação de senha, autenticação multifator ou integração de identidade; estabeleça esses controles e obtenha revisão técnica antes de disponibilizar dados fiscais reais.
@@ -247,3 +282,5 @@ Rode sempre pelo `discover`, a partir da pasta do projeto (os testes importam aj
 | `test_backup.py` | backup, retenção, conferência e restauração |
 | `test_cli.py` | checagem de inicialização, `.env` e rota `/saude` |
 | `test_handler.py` | telas e rotas: perfis, matriz e filiais, pop-up, monitoramento |
+| `test_contatos.py` | leitura da planilha, separação de destinatários e cópias, comando de importação |
+| `test_emails.py` | fila de avisos: publicação, modo de teste, travas, varredura e tela |

@@ -96,6 +96,7 @@ a{color:inherit;text-decoration:none}
 .audit-what{display:flex;align-items:flex-start;gap:10px;min-width:280px;white-space:normal}.audit-what>span:last-child{min-width:0;overflow-wrap:anywhere}
 .audit-badge{flex:none;display:inline-flex;align-items:center;height:22px;padding:0 8px;border-radius:99px;font-size:10px;font-weight:700;letter-spacing:.3px}
 .badge-acessos{background:#e5f7f4;color:#075e59}.badge-consultas{background:#eef2f1;color:#3e5653}.badge-downloads{background:var(--green-deep);color:#fff}.badge-alertas{background:#fdecea;color:#a53b34}
+.email-subject{margin:8px 0 4px;font-size:11px;font-weight:700;white-space:normal}.email-body{margin:0;padding:10px;border-radius:8px;background:#f5f8f7;font-family:inherit;font-size:11px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}
 
 /* Previsão de publicação e ajuda "?" */
 .forecast-card{display:flex;align-items:flex-start;gap:16px;background:#fff;border:1px solid var(--line);border-radius:7px;padding:22px 24px}

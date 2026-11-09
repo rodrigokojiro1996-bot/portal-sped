@@ -55,6 +55,14 @@ FORECAST_UNTIL = os.environ.get("PORTAL_PREVISAO_ATE", "2026-12")
 # Para reativar: PORTAL_MONITORAMENTO=1 no ambiente ou no .env.
 MONITORING_ENABLED = os.environ.get("PORTAL_MONITORAMENTO", "0") == "1"
 
+# Avisos de publicação por e-mail: DESLIGADOS por padrão. Desligado, nada entra na fila.
+# Ligado, a fila funciona em modo de teste: nenhum e-mail sai do portal (veja portal/emails.py).
+EMAIL_ENABLED = os.environ.get("PORTAL_EMAIL", "0") == "1"
+# Se preenchido, troca todo destinatário por estes endereços. Trava contra disparo acidental.
+EMAIL_REDIRECT = os.environ.get("PORTAL_EMAIL_REDIRECIONAR", "").strip()
+# Endereço público do portal. Vazio, o aviso sai sem link.
+PUBLIC_URL = os.environ.get("PORTAL_URL_PUBLICA", "").strip().rstrip("/")
+
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024
 SESSION_SECONDS = 8 * 60 * 60
 LOGIN_FORM_SECONDS = 2 * 60 * 60

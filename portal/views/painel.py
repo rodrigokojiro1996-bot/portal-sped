@@ -56,10 +56,15 @@ def sidebar(user: sqlite3.Row, stores: list[sqlite3.Row], selected_store: sqlite
         f"<span class='tab-mark'>{mark}</span><span class='tab-text'>{label}<small>{subject}</small></span></a>"
         for key, (label, subject, mark) in DOCUMENT_TYPES.items())
     navigation = f"<nav class='sped-navigation' aria-label='Tipo de arquivo'><span class='side-section-label'>ARQUIVOS</span>{tabs}</nav>"
+    tools = ""
     if admin and config.MONITORING_ENABLED:
-        navigation += (f"<nav class='sped-navigation' aria-label='Administração'><span class='side-section-label'>ADMINISTRAÇÃO</span>"
-                       f"<a class='sped-tab{CURRENT if section == 'monitoramento' else ''}' href='/monitoramento'><span class='tab-mark'>{icon('eye')}</span>"
-                       "<span class='tab-text'>Monitoramento<small>Ações do suporte</small></span></a></nav>")
+        tools += (f"<a class='sped-tab{CURRENT if section == 'monitoramento' else ''}' href='/monitoramento'><span class='tab-mark'>{icon('eye')}</span>"
+                  "<span class='tab-text'>Monitoramento<small>Ações do suporte</small></span></a>")
+    if admin and config.EMAIL_ENABLED:
+        tools += (f"<a class='sped-tab{CURRENT if section == 'emails' else ''}' href='/emails'><span class='tab-mark'>{icon('mail')}</span>"
+                  "<span class='tab-text'>E-mails<small>Fila de avisos</small></span></a>")
+    if tools:
+        navigation += f"<nav class='sped-navigation' aria-label='Administração'><span class='side-section-label'>ADMINISTRAÇÃO</span>{tools}</nav>"
     return f"<aside class='workspace-sidebar'><div class='side-overline'>PORTAL DA REDE</div>{card}{branches}{navigation}<div class='side-bottom'><span class='secure-dot'></span> Acesso protegido</div></aside>"
 
 
