@@ -18,9 +18,10 @@ def access_row(entry: sqlite3.Row) -> str:
     certificate = (f"<strong>{h(format_cnpj(entry['certificate_cnpj']))}</strong><small>Série {h(entry['certificate_serial'])}</small>" if entry["certificate_cnpj"]
                    else "<span class='muted'>Não identificado</span>")
     store = f"<strong>{h(entry['store_name'])}</strong><small>{h(format_cnpj(entry['store_cnpj']))}</small>" if entry["store_name"] else "<span class='muted'>—</span>"
+    host = f"<small class='audit-host'>{h(entry['hostname'])}</small>" if entry["hostname"] else ""
     return (f"<tr><td class='mono'>{moment:%d/%m/%Y %H:%M}</td><td class='audit-cell'><span class='audit-badge {EVENT_BADGES[entry['event']]}'>{h(EVENTS[entry['event']])}</span></td>"
             f"<td class='audit-cell'>{certificate}</td><td class='audit-cell'>{store}</td><td class='audit-cell audit-what'><span>{h(detail(entry))}</span></td>"
-            f"<td class='audit-cell audit-machine'><strong>{h(entry['ip'])}</strong><small>{h(entry['browser'])}</small></td></tr>")
+            f"<td class='audit-cell audit-machine'><strong>{h(entry['ip'])}</strong>{host}<small>{h(entry['browser'])}</small></td></tr>")
 
 
 def access_main(stores: list[sqlite3.Row], entries: list[sqlite3.Row], store_filter: str, period: str) -> str:
@@ -44,6 +45,7 @@ def access_main(stores: list[sqlite3.Row], entries: list[sqlite3.Row], store_fil
         history = (f"<div class='empty-state'><span class='empty-mark'>{icon('lock')}</span><strong>Nenhum acesso neste período</strong>"
                    "<span>Mude a loja ou o período para ver outros registros.</span></div>")
     note = ("<p class='summary-note'>O certificado é identificado pelo CNPJ e pelo número de série; o CPF do responsável não é guardado. "
+            "Abaixo do IP vem o nome reverso, que pela internet costuma ser o da operadora, e não o do computador. "
             "Visitas sem certificado e downloads de quem entrou com senha não aparecem aqui.</p>")
     return (page_heading("Administração", "Acessos por certificado", "Quem entrou pelo certificado digital, o que baixou e o que foi recusado.") + filters
             + "<section class='section-block'><div class='section-heading'><div><span class='section-kicker'>HISTÓRICO</span><h2>O que aconteceu</h2></div>"
@@ -52,11 +54,11 @@ def access_main(stores: list[sqlite3.Row], entries: list[sqlite3.Row], store_fil
 
 def access_csv(entries: list[sqlite3.Row]) -> bytes:
     """Histórico filtrado em CSV (separador ; e acentos corretos no Excel)."""
-    header = ("Data", "Hora", "O que aconteceu", "CNPJ do certificado", "Série do certificado", "Loja", "CNPJ da loja", "Detalhe", "IP", "Navegador")
+    header = ("Data", "Hora", "O que aconteceu", "CNPJ do certificado", "Série do certificado", "Loja", "CNPJ da loja", "Detalhe", "IP", "Nome reverso", "Navegador")
     lines = [";".join(csv_cell(value) for value in header)]
     for entry in entries:
         moment = datetime.fromisoformat(entry["created_at"])
         values = (f"{moment:%d/%m/%Y}", f"{moment:%H:%M:%S}", EVENTS[entry["event"]], format_cnpj(entry["certificate_cnpj"]) if entry["certificate_cnpj"] else "", entry["certificate_serial"],
-                  entry["store_name"], format_cnpj(entry["store_cnpj"]) if entry["store_cnpj"] else "", detail(entry), entry["ip"], entry["browser"])
+                  entry["store_name"], format_cnpj(entry["store_cnpj"]) if entry["store_cnpj"] else "", detail(entry), entry["ip"], entry["hostname"], entry["browser"])
         lines.append(";".join(csv_cell(value) for value in values))
     return ("﻿" + "\r\n".join(lines) + "\r\n").encode("utf-8")

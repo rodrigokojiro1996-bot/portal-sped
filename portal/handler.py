@@ -275,11 +275,13 @@ class PortalHandler(BaseHTTPRequestHandler):
             return
         now = int(time.time())
         raw_token = secrets.token_urlsafe(32)
+        ip = self.client_ip()
+        hostname = acessos.hostname_of(ip)  # antes da transação: o DNS pode demorar
+        opened = next((item for item in certificado.stores_of(certificate.cnpj) if str(item["id"]) == requested), store)
         with connect() as db:
             db.execute("DELETE FROM sessions WHERE user_id=? AND expires_at<=?", (store["id"], now))
             db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", (token_hash(raw_token), store["id"], secrets.token_urlsafe(24), now + config.SESSION_SECONDS))
-            opened = next((item for item in certificado.stores_of(certificate.cnpj) if str(item["id"]) == requested), store)
-            acessos.record_entry(db, certificate, opened, token_hash(raw_token), self.client_ip(), agent)
+            acessos.record_entry(db, certificate, opened, token_hash(raw_token), ip, hostname, agent)
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", target)
         self.send_header("Set-Cookie", session_cookie_header(raw_token))

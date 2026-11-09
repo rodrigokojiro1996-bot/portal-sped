@@ -18,6 +18,7 @@ Mudanças do Portal Fiscal por versão. Detalhes técnicos em [docs/versao-1.6.m
   - `python app.py conferir-certificado ARQUIVO.cer` mostra o que o portal lê de um certificado.
 - **Registro de acessos por certificado** (tela **Acessos**, com filtros e exportação para Excel). Guarda entradas, recusas e downloads, com o CNPJ e o número de série do certificado, sem o CPF do responsável. Nenhum acesso por certificado acontece sem registro.
 - Migração `006`: tabela `certificate_access`.
+- **Nome reverso do IP** no registro de acessos, na tela e no Excel, confirmado de volta para o mesmo IP. Pela internet costuma ser o nome da operadora. Migração `007`.
 - `PORTAL_ATRAS_DE_PROXY=1`: o limite de tentativas de login e o monitoramento usam o endereço real de quem acessa, vindo do `X-Forwarded-For`.
 
 ### Corrigido
